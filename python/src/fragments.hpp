@@ -47,8 +47,10 @@ void precalculate_pseudobulk_coverage(
     std::vector<uint32_t> chr_size,
     std::vector<int32_t> cell_groups,
     int bin_size,
-    int threads
+    int threads,
+    std::optional<std::vector<std::string>> group_names = std::nullopt
 );
+
 
 Eigen::MatrixXi query_precalculated_pseudobulk_coverage(
     std::string mat_path,

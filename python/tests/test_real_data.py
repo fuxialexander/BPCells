@@ -63,6 +63,9 @@ def test_500_pbmc_matrix(tmp_path, fetch_cached_file):
     cell_metadata = cell_metadata[cell_metadata.passed_filters >= 1]
     clusts = cell_metadata.barcode.str.slice(0,2)
     group_order = sorted(clusts.unique())
+    
+    # Create more human-readable group names for the test
+    custom_group_names = [f"Group-{name}" for name in group_order]
 
     groups = bpcells.experimental.build_cell_groups(
         bpcells_path,
@@ -115,9 +118,18 @@ def test_500_pbmc_matrix(tmp_path, fetch_cached_file):
         precalculated_path,
         groups,
         chrom_sizes,
-        threads=4
+        threads=4,
+        group_names=custom_group_names
     )
     m = bpcells.experimental.PrecalculatedInsertionMatrix(precalculated_path)
     assert m.shape[0] == len(group_order)
     basepair_precalculated = m.get_counts(peak_subset)
     assert np.all(basepair_precalculated == basepair_matrix)
+    # Test getting library sizes from the matrix object
+    lib_sizes = m.library_size
+    assert len(lib_sizes) == len(group_order)
+    assert np.all(lib_sizes > 0)  # All groups should have some insertions
+    
+    # Test that group names were properly saved and loaded
+    assert m.group_names == custom_group_names
+

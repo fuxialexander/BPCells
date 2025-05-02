@@ -157,18 +157,22 @@ Eigen::MatrixXi pseudobulk_coverage(
     }
 
     std::unique_ptr<MatrixLoader<uint32_t>> tile_mat = std::make_unique<TileMatrix>(
-        std::move(frags), chr_id, start, end, width, std::make_unique<VecStringReader>(chr_levels)
+        std::move(frags), chr_id, start, end, width, std::make_unique<VecStringReader>(chr_levels), false
     );
 
     return run_with_py_interrupt_check(&matrix_loader_to_eigen_helper, std::move(tile_mat));
 }
 
 template <typename T>
-void parallel_map_helper(std::vector<std::future<T>> &futures, size_t threads) {
+void parallel_map_helper(std::vector<std::future<T>> &futures, size_t threads, std::vector<T> *results = nullptr) {
     // Non-threaded fallback
     if (threads == 0) {
         for (size_t i = 0; i < futures.size(); i++) {
-            futures[i].get();
+            if (results) {
+                (*results)[i] = futures[i].get();
+            } else {
+                futures[i].get();
+            }
         }
         return;
     }
@@ -179,12 +183,16 @@ void parallel_map_helper(std::vector<std::future<T>> &futures, size_t threads) {
     std::exception_ptr exception;
     std::vector<std::thread> thread_vec;
     for (size_t i = 0; i < threads; i++) {
-        thread_vec.push_back(std::thread([&futures, &task_id, &has_error, &exception] {
+        thread_vec.push_back(std::thread([&futures, &task_id, &has_error, &exception, results] {
             while (true) {
                 size_t cur_task = task_id.fetch_add(1);
                 if (cur_task >= futures.size()) break;
                 try {
-                    futures[cur_task].get();
+                    if (results) {
+                        (*results)[cur_task] = futures[cur_task].get();
+                    } else {
+                        futures[cur_task].get();
+                    }
                 } catch (...) {
                     if (!has_error) {
                         has_error = true;
@@ -206,7 +214,7 @@ void parallel_map_helper(std::vector<std::future<T>> &futures, size_t threads) {
 }
 
 // Write a chunk of the tile matrix columns to the given output path
-static void precalculate_pseudobulk_coverage_helper(
+static std::vector<uint64_t> precalculate_pseudobulk_coverage_helper(
     std::string fragments_path,
     std::string chunk_output_path,
     std::pair<uint32_t, uint32_t> chunk_col_range,
@@ -233,10 +241,53 @@ static void precalculate_pseudobulk_coverage_helper(
 
     // Construct tile matrix
     std::unique_ptr<MatrixLoader<uint32_t>> tile_mat = std::make_unique<TileMatrix>(
-        std::move(frags), chr_id, start, end, width, std::make_unique<VecStringReader>(chr_levels)
+        std::move(frags), chr_id, start, end, width, std::make_unique<VecStringReader>(chr_levels), false
     );
 
     // Subset to the desired columns
+    tile_mat = std::make_unique<MatrixColSlice<uint32_t>>(
+        std::move(tile_mat), chunk_col_range.first, chunk_col_range.second
+    );
+
+    // Track per-group sums in this chunk
+    std::vector<uint64_t> group_sums(group_names.size(), 0);
+    
+    // Use an alternative approach instead of clone() which doesn't exist
+    // Process the matrix directly for group sums
+    MatrixIterator<uint32_t> it(std::move(tile_mat));
+    
+    // Calculate running sums
+    while (it.nextCol()) {
+        while (it.nextValue()) {
+            if (it.row() < group_sums.size()) {
+                group_sums[it.row()] += it.val();
+            }
+        }
+    }
+    
+    // Reset the tile_mat since we moved it
+    FileReaderBuilder rb_new(fragments_path);
+    auto frags_new = std::make_unique<StoredFragmentsPacked>(StoredFragmentsPacked::openPacked(rb_new));
+    
+    // Create a new CellMerge object
+    auto merged_frags = std::make_unique<CellMerge>(
+        std::move(frags_new), 
+        group_ids, 
+        std::make_unique<VecStringReader>(group_names)
+    );
+    
+    // Properly construct TileMatrix (not a template)
+    tile_mat = std::make_unique<TileMatrix>(
+        std::move(merged_frags), 
+        chr_id,
+        start,
+        end,
+        width,
+        std::make_unique<VecStringReader>(chr_levels),
+        false // Use default value for preserve_zero
+    );
+    
+    // Apply the same column slice
     tile_mat = std::make_unique<MatrixColSlice<uint32_t>>(
         std::move(tile_mat), chunk_col_range.first, chunk_col_range.second
     );
@@ -250,6 +301,8 @@ static void precalculate_pseudobulk_coverage_helper(
     // Write to output
     FileWriterBuilder wb(chunk_output_path);
     EXPERIMENTAL_createPackedSparseColumn<uint32_t>(wb).write(*tile_mat, user_interrupt);
+    
+    return group_sums;
 }
 
 void precalculate_pseudobulk_coverage(
@@ -260,7 +313,8 @@ void precalculate_pseudobulk_coverage(
     std::vector<uint32_t> chr_len,
     std::vector<int32_t> cell_groups,
     int bin_size,
-    int threads
+    int threads,
+    std::optional<std::vector<std::string>> group_names
 ) {
     // Create the arguments needed for TileMatrix: start, tile_width, chr_id, chr_levels (end =
     // chr_len)
@@ -298,6 +352,22 @@ void precalculate_pseudobulk_coverage(
         dummy_names.push_back(std::to_string(i));
     }
 
+    // If user-provided group names exist, use them (ensuring correct size)
+    std::vector<std::string> actual_group_names;
+    if (group_names.has_value()) {
+        actual_group_names = group_names.value();
+        // Make sure we have enough names, fill with defaults if needed
+        if (actual_group_names.size() < num_groups) {
+            for (size_t i = actual_group_names.size(); i < num_groups; i++) {
+                actual_group_names.push_back(std::to_string(i));
+            }
+        }
+        // Add one more for the discard group
+        actual_group_names.push_back("discard");
+    } else {
+        actual_group_names = dummy_names;
+    }
+
     std::vector<uint32_t> cell_groups_uint;
     for (const auto &x : cell_groups) {
         cell_groups_uint.push_back(x >= 0 ? x : num_groups + 1);
@@ -322,20 +392,26 @@ void precalculate_pseudobulk_coverage(
         chunk_output_paths.push_back((std_fs::path(tmp_path) / std::to_string(i)).string());
     }
 
+    // Vector to store group sums from all chunks
+    std::vector<std::vector<uint64_t>> all_group_sums;
+    
     // Make all the matrix chunks
     run_with_py_interrupt_check([&fragments_path,
                                         &chunk_output_paths,
                                         &chunk_col_splits,
                                         &cell_groups_uint,
-                                        &dummy_names,
+                                        &actual_group_names,
                                         &chr_id,
                                         &start,
                                         &chr_len,
                                         &tile_width,
                                         &chr_levels,
+                                        &all_group_sums,
                                         threads,
                                         chunks](std::atomic<bool> *user_interrupt) {
-        std::vector<std::future<void>> task_vec;
+        std::vector<std::future<std::vector<uint64_t>>> task_vec;
+        all_group_sums.resize(chunks);
+        
         for (size_t i = 0; i < chunks; i++) {
             task_vec.push_back(std::async(
                 std::launch::deferred,
@@ -345,7 +421,7 @@ void precalculate_pseudobulk_coverage(
                 chunk_col_splits[i],
 
                 std::cref(cell_groups_uint),
-                std::cref(dummy_names),
+                std::cref(actual_group_names),
 
                 std::cref(chr_id),
                 std::cref(start),
@@ -357,8 +433,20 @@ void precalculate_pseudobulk_coverage(
             ));
         }
 
-        parallel_map_helper(task_vec, threads);
+        // Process the futures and collect the group sums in parallel
+        parallel_map_helper(task_vec, threads, &all_group_sums);
     });
+
+    // Combine group sums from all chunks
+    std::vector<uint64_t> total_group_sums(num_groups + 1, 0);
+    for (const auto &chunk_sums : all_group_sums) {
+        for (size_t i = 0; i < chunk_sums.size() && i < total_group_sums.size(); i++) {
+            total_group_sums[i] += chunk_sums[i];
+        }
+    }
+    
+    // Only keep the actual groups (exclude the last "discard" group) - save for later use
+    std::vector<uint64_t> final_group_sums(total_group_sums.begin(), total_group_sums.begin() + num_groups);
 
     std::vector<std::unique_ptr<MatrixLoader<uint32_t>>> matrix_chunks;
     for (size_t i = 0; i < chunks; i++) {
@@ -393,6 +481,45 @@ void precalculate_pseudobulk_coverage(
 
     for (const auto &x : chunk_output_paths) {
         std_fs::remove_all(std_fs::path(x));
+    }
+    
+    // Now write the library sizes after the matrix is fully created
+    // Ensure the output directory exists (only create if it doesn't exist)
+    if (!std_fs::exists(std_fs::path(output_path))) {
+        std_fs::create_directories(std_fs::path(output_path));
+    }
+    
+    // Write the library sizes to a binary file
+    std::string actual_library_size_path = (std_fs::path(output_path) / "library_size").string();
+    std::ofstream out_file(actual_library_size_path, std::ios::binary);
+    if (!out_file) {
+        throw std::runtime_error("Could not open file for writing library sizes: " + actual_library_size_path);
+    }
+    
+    // Write the number of groups
+    uint32_t size = final_group_sums.size();
+    out_file.write(reinterpret_cast<const char*>(&size), sizeof(size));
+    
+    // Write the library sizes
+    out_file.write(reinterpret_cast<const char*>(final_group_sums.data()), 
+                   final_group_sums.size() * sizeof(uint64_t));
+    
+    out_file.close();
+    
+    // Write the group names to a JSON file
+    std::string group_names_path = (std_fs::path(output_path) / "group_names.json").string();
+    std::ofstream group_names_file(group_names_path);
+    if (group_names_file) {
+        group_names_file << "[\n";
+        for (size_t i = 0; i < num_groups; i++) {
+            group_names_file << "  \"" << actual_group_names[i] << "\"";
+            if (i < num_groups - 1) {
+                group_names_file << ",";
+            }
+            group_names_file << "\n";
+        }
+        group_names_file << "]\n";
+        group_names_file.close();
     }
 }
 
@@ -431,5 +558,6 @@ Eigen::MatrixXi query_precalculated_pseudobulk_coverage(
     }
     return ret;
 }
+
 
 } // namespace BPCells::py

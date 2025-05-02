@@ -123,10 +123,30 @@ class PrecalculatedInsertionMatrix:
         self._dir = str(os.path.abspath(os.path.expanduser(path)))
         
         self._chrom_offsets = json.load(open(f"{self._dir}/chrom_offsets.json"))
+        self._library_size = self.load_library_sizes()
 
     @property
     def shape(self) -> Tuple[int, int]:
         return tuple(np.fromfile(f"{self._dir}/shape", np.uint32, 2, offset=8))
+
+    @property
+    def library_size(self) -> np.ndarray:
+        return self._library_size
+    
+    @property
+    def group_names(self) -> List[str]:
+        """Return the group names for each pseudobulk
+
+        Returns:
+            list: List of group names in the same order as library_size
+        """
+        group_names_path = os.path.join(self._dir, "group_names.json")
+        if os.path.exists(group_names_path):
+            with open(group_names_path, 'r') as f:
+                return json.load(f)
+        else:
+            # Fall back to numeric names if file doesn't exist
+            return [str(i) for i in range(len(self._library_size))]
 
     def __repr__(self):
         return f"<PrecalculatedInsertionMatrix with {self.shape[0]} pseudobulks and {len(self._chrom_offsets)} chromomsomes stored in \n\t{self._dir}"
@@ -157,7 +177,35 @@ class PrecalculatedInsertionMatrix:
             .reshape((region_size, regions.shape[0], -1), order="F")\
             .transpose((1,2,0))
 
-def precalculate_insertion_counts(fragments: str, output_dir: str, cell_groups: Sequence[int], chrom_sizes: Union[str, Dict[str, int]], threads: int = 0):
+    def load_library_sizes(self) -> np.ndarray:
+        """Load library sizes (total insertion counts) from a binary file
+
+        Args:
+            filepath (str, optional): Path to the binary file containing library sizes.
+                If None, will try to use the standard 'library_size' file in the current directory.
+            
+        Returns:
+            numpy.ndarray: Array of library sizes (one value per group)
+        """
+        # If no path provided, try the default location
+        filepath = os.path.join(self._dir, "library_size")
+        
+        with open(filepath, 'rb') as f:
+            # Read the number of groups (uint32)
+            size_bytes = f.read(4)
+            if len(size_bytes) < 4:
+                raise ValueError("Invalid library size file format")
+            size = np.frombuffer(size_bytes, dtype=np.uint32)[0]
+            
+            # Read the library sizes (uint64 for each group)
+            data_bytes = f.read(size * 8)  # 8 bytes per uint64
+            if len(data_bytes) < size * 8:
+                raise ValueError("Invalid library size file format")
+            return np.frombuffer(data_bytes, dtype=np.uint64)
+
+def precalculate_insertion_counts(fragments: str, output_dir: str, cell_groups: Sequence[int], 
+                                 chrom_sizes: Union[str, Dict[str, int]], threads: int = 0,
+                                 group_names: Optional[List[str]] = None):
     """Precalculate per-base insertion counts from fragment data
 
     The current implementation is EXPERIMENTAL, and will crash for matrices with more than
@@ -169,6 +217,7 @@ def precalculate_insertion_counts(fragments: str, output_dir: str, cell_groups: 
         cell_groups (list[int]): List of pseudbulk groupings as created by :func:`build_cell_groups()`
         chrom_sizes (str | dict[str, int]): Path/URL of UCSC-style chrom.sizes file, or dictionary mapping chromosome names to sizes
         threads (int): Number of threads to use during matrix calculation (default = 1)
+        group_names (list[str], optional): Names for each group in the same order as group indices (0, 1, 2, ...)
     
     Returns:
         A :class:`PrecalculatedInsertionMatrix` object
@@ -194,7 +243,8 @@ def precalculate_insertion_counts(fragments: str, output_dir: str, cell_groups: 
         list(chrom_sizes.values()),
         cell_groups,
         1,
-        threads
+        threads,
+        group_names
     )
     
     chrom_offsets = dict(zip(chrom_sizes.keys(), [0] + np.cumsum(list(chrom_sizes.values()))[:-1].tolist()))

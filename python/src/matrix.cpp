@@ -26,7 +26,8 @@
 #include "bpcells-cpp/matrixIterators/MatrixIndexSelect.h"
 #include "bpcells-cpp/matrixIterators/StoredMatrix.h"
 #include "bpcells-cpp/matrixIterators/StoredMatrixWriter.h"
-#include "bpcells-cpp/matrixIterators/ImportMatrixHDF5.h"
+#include "bpcells-cpp/matrixIterators/ImportMatrix10xHDF5.h"
+#include "bpcells-cpp/matrixIterators/ImportMatrixAnnDataHDF5.h"
 #include "bpcells-cpp/matrixIterators/ConcatenateMatrix.h"
 
 
@@ -105,13 +106,14 @@ void write_matrix_dir_from_h5ad(std::string h5ad_path, std::string out_path, std
     auto row_names = std::make_unique<VecStringReader>(empty_names);
     auto col_names = std::make_unique<VecStringReader>(empty_names);
 
-    auto mat_float = std::make_unique<StoredMatrix<float>>(openAnnDataMatrix<float>(
+    // Get the AnnData matrix directly
+    auto mat_float = openAnnDataMatrix<float>(
         h5ad_path,
         group,
         16384L, // Just provide a default buffer size matching what R uses
         std::move(row_names),
         std::move(col_names)
-    ));
+    );
     auto mat_int = std::make_unique<MatrixConverterLoader<float, uint32_t>>(std::move(mat_float));
     
     bool row_major = isRowOrientedAnnDataMatrix(h5ad_path, group);

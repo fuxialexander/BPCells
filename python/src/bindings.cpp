@@ -34,7 +34,11 @@ PYBIND11_MODULE(cpp, m) {
     m.def("cell_names_fragments_dir", &BPCells::py::cell_names_fragments_dir);
     m.def("chr_names_fragments_dir", &BPCells::py::chr_names_fragments_dir);
     m.def("pseudobulk_coverage", &BPCells::py::pseudobulk_coverage);
-    m.def("precalculate_pseudobulk_coverage", &BPCells::py::precalculate_pseudobulk_coverage);
+    m.def("precalculate_pseudobulk_coverage", &BPCells::py::precalculate_pseudobulk_coverage,
+          pybind11::arg("fragments_path"), pybind11::arg("output_path"), 
+          pybind11::arg("tmp_path"), pybind11::arg("chr"), pybind11::arg("chr_size"), 
+          pybind11::arg("cell_groups"), pybind11::arg("bin_size"), pybind11::arg("threads"),
+          pybind11::arg("group_names") = nullptr);
     m.def("query_precalculated_pseudobulk_coverage", &BPCells::py::query_precalculated_pseudobulk_coverage);
         
     m.def("write_matrix_dir_from_memory", &BPCells::py::write_matrix_dir_from_memory);
