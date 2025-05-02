@@ -189,7 +189,8 @@ class PrecalculatedInsertionMatrix:
         """
         # If no path provided, try the default location
         filepath = os.path.join(self._dir, "library_size")
-        
+        if not os.path.exists(filepath):
+            return None
         with open(filepath, 'rb') as f:
             # Read the number of groups (uint32)
             size_bytes = f.read(4)
