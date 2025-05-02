@@ -250,3 +250,72 @@ def precalculate_insertion_counts(fragments: str, output_dir: str, cell_groups: 
     chrom_offsets = dict(zip(chrom_sizes.keys(), [0] + np.cumsum(list(chrom_sizes.values()))[:-1].tolist()))
     json.dump(chrom_offsets, open(f"{output_dir}/chrom_offsets.json", "w"), indent=2)
     return PrecalculatedInsertionMatrix(output_dir)
+
+class MultiPrecalculatedInsertionMatrix:
+    """
+    Wrapper class that combines multiple PrecalculatedInsertionMatrix objects
+    
+    This allows loading and querying counts from multiple insertion matrices and concatenating
+    the results along the pseudobulks dimension (dimension 1 in (region, pseudobulks, position)).
+    
+    Args:
+        matrices (list[Union[str, PrecalculatedInsertionMatrix]]): List of PrecalculatedInsertionMatrix objects
+            or paths to matrix directories
+    """
+    def __init__(self, matrices: List[Union[str, "PrecalculatedInsertionMatrix"]]):
+        self._matrices = [
+            m if isinstance(m, PrecalculatedInsertionMatrix) else PrecalculatedInsertionMatrix(m)
+            for m in matrices
+        ]
+        
+        # Calculate combined shape
+        self._combined_shape = (
+            sum(m.shape[0] for m in self._matrices),  # Sum of pseudobulks
+            self._matrices[0].shape[1]                # Genome size (should be the same for all)
+        )
+        
+        # Combine library sizes
+        self._combined_library_size = np.concatenate([m.library_size for m in self._matrices])
+        
+        # Combine group names
+        self._combined_group_names = []
+        for m in self._matrices:
+            self._combined_group_names.extend(m.group_names)
+    
+    @property
+    def shape(self) -> Tuple[int, int]:
+        return self._combined_shape
+    
+    @property
+    def library_size(self) -> np.ndarray:
+        return self._combined_library_size
+    
+    @property
+    def group_names(self) -> List[str]:
+        """Return the combined group names for all pseudobulks
+        
+        Returns:
+            list: List of group names in the same order as library_size
+        """
+        return self._combined_group_names
+    
+    def __repr__(self):
+        return f"<MultiPrecalculatedInsertionMatrix with {self.shape[0]} total pseudobulks from {len(self._matrices)} matrices>"
+    
+    def get_counts(self, regions: pd.DataFrame) -> np.ndarray:
+        """Load pseudobulk insertion counts from all matrices
+        
+        Args:
+            regions (pandas.DataFrame): Pandas dataframe with columns (``chrom``, ``start``, ``end``) representing
+                genomic ranges (0-based, end-exclusive like BED format). All regions must be the same size.
+                ``chrom`` should be a string column; ``start``/``end`` should be numeric.
+        
+        Returns:
+            numpy.ndarray: Numpy array of dimensions (region, psudobulks, position) and type numpy.int32
+            where pseudobulks dimension is concatenated from all matrices
+        """
+        # Get counts from each matrix
+        counts_list = [m.get_counts(regions) for m in self._matrices]
+        
+        # Concatenate along pseudobulks dimension (axis 1)
+        return np.concatenate(counts_list, axis=1)
