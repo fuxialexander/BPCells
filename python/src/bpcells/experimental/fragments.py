@@ -263,12 +263,12 @@ class MultiPrecalculatedInsertionMatrix:
         matrices (list[Union[str, PrecalculatedInsertionMatrix]]): List of PrecalculatedInsertionMatrix objects
             or paths to matrix directories
     """
-    def __init__(self, matrices: List[Union[str, "PrecalculatedInsertionMatrix"]]):
+    def __init__(self, matrices: List[Union[str, "PrecalculatedInsertionMatrix"]], aggregation='concat'):
         self._matrices = [
             m if isinstance(m, PrecalculatedInsertionMatrix) else PrecalculatedInsertionMatrix(m)
             for m in matrices
         ]
-        
+        self._aggregation = aggregation
         # Calculate combined shape
         self._combined_shape = (
             sum(m.shape[0] for m in self._matrices),  # Sum of pseudobulks
@@ -278,11 +278,17 @@ class MultiPrecalculatedInsertionMatrix:
         # Combine library sizes
         self._combined_library_size = np.concatenate([m.library_size for m in self._matrices])
         
-        # Combine group names
-        self._combined_group_names = []
-        for m in self._matrices:
-            self._combined_group_names.extend(m.group_names)
-    
+        if self._aggregation == 'concat':
+            # Combine group names
+            self._combined_group_names = []
+            for m in self._matrices:
+                self._combined_group_names.extend(m.group_names)
+        elif self._aggregation == 'sum':
+            assert all(m.group_names == self._matrices[0].group_names for m in self._matrices)
+            self._combined_group_names = self._matrices[0].group_names
+        else:
+            raise ValueError(f"Invalid aggregation: {self._aggregation}")
+        
     @property
     def shape(self) -> Tuple[int, int]:
         return self._combined_shape
@@ -319,4 +325,11 @@ class MultiPrecalculatedInsertionMatrix:
         counts_list = [m.get_counts(regions) for m in self._matrices]
         
         # Concatenate along pseudobulks dimension (axis 1)
-        return np.concatenate(counts_list, axis=1)
+        if self._aggregation == 'concat':
+            return np.concatenate(counts_list, axis=1)
+        elif self._aggregation == 'sum':
+            # test all counts_list have the same shape
+            assert all(counts_list[0].shape == c.shape for c in counts_list)
+            return np.sum(counts_list, axis=1)
+        else:
+            raise ValueError(f"Invalid aggregation: {self._aggregation}")
