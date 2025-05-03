@@ -262,32 +262,57 @@ class MultiPrecalculatedInsertionMatrix:
     Args:
         matrices (list[Union[str, PrecalculatedInsertionMatrix]]): List of PrecalculatedInsertionMatrix objects
             or paths to matrix directories
+        collapse_group (bool): If True, automatically sum up library sizes and counts for groups with
+            the same name. Default is False.
     """
-    def __init__(self, matrices: List[Union[str, "PrecalculatedInsertionMatrix"]], aggregation='concat'):
+    def __init__(self, matrices: List[Union[str, "PrecalculatedInsertionMatrix"]], collapse_group: bool = False):
         self._matrices = [
             m if isinstance(m, PrecalculatedInsertionMatrix) else PrecalculatedInsertionMatrix(m)
             for m in matrices
         ]
-        self._aggregation = aggregation
-        # Calculate combined shape
-        self._combined_shape = (
-            sum(m.shape[0] for m in self._matrices),  # Sum of pseudobulks
-            self._matrices[0].shape[1]                # Genome size (should be the same for all)
-        )
+        self._chrom_offsets = self._matrices[0]._chrom_offsets
+        self._collapse_group = collapse_group
         
-        # Combine library sizes
-        self._combined_library_size = np.concatenate([m.library_size for m in self._matrices])
+        # Collect all group names from all matrices
+        all_group_names = []
+        for m in self._matrices:
+            all_group_names.extend(m.group_names)
         
-        if self._aggregation == 'concat':
-            # Combine group names
-            self._combined_group_names = []
-            for m in self._matrices:
-                self._combined_group_names.extend(m.group_names)
-        elif self._aggregation == 'sum':
-            assert all(m.group_names == self._matrices[0].group_names for m in self._matrices)
-            self._combined_group_names = self._matrices[0].group_names
+        # Collect all library sizes from all matrices
+        all_library_sizes = np.concatenate([m.library_size for m in self._matrices])
+        
+        if collapse_group:
+            # Create mapping from unique group names to their original indices
+            self._unique_group_names = []
+            self._group_indices_map = {}
+            
+            for i, name in enumerate(all_group_names):
+                if name not in self._group_indices_map:
+                    self._group_indices_map[name] = []
+                    self._unique_group_names.append(name)
+                self._group_indices_map[name].append(i)
+            
+            # Calculate combined library size by summing up sizes for the same group
+            self._combined_library_size = np.array([
+                np.sum(all_library_sizes[indices]) for indices in self._group_indices_map.values()
+            ])
+            
+            # Combined shape with unique groups
+            self._combined_shape = (
+                len(self._unique_group_names),  # Number of unique groups
+                self._matrices[0].shape[1]      # Genome size (should be the same for all)
+            )
+            
+            self._combined_group_names = self._unique_group_names
         else:
-            raise ValueError(f"Invalid aggregation: {self._aggregation}")
+            # Calculate combined shape
+            self._combined_shape = (
+                sum(m.shape[0] for m in self._matrices),  # Sum of pseudobulks
+                self._matrices[0].shape[1]                # Genome size (should be the same for all)
+            )
+            
+            self._combined_group_names = all_group_names
+            self._combined_library_size = all_library_sizes
         
     @property
     def shape(self) -> Tuple[int, int]:
@@ -307,7 +332,10 @@ class MultiPrecalculatedInsertionMatrix:
         return self._combined_group_names
     
     def __repr__(self):
-        return f"<MultiPrecalculatedInsertionMatrix with {self.shape[0]} total pseudobulks from {len(self._matrices)} matrices>"
+        if self._collapse_group:
+            return f"<MultiPrecalculatedInsertionMatrix with {self.shape[0]} unique groups (collapsed) from {len(self._matrices)} matrices>"
+        else:
+            return f"<MultiPrecalculatedInsertionMatrix with {self.shape[0]} total pseudobulks from {len(self._matrices)} matrices>"
     
     def get_counts(self, regions: pd.DataFrame) -> np.ndarray:
         """Load pseudobulk insertion counts from all matrices
@@ -325,11 +353,17 @@ class MultiPrecalculatedInsertionMatrix:
         counts_list = [m.get_counts(regions) for m in self._matrices]
         
         # Concatenate along pseudobulks dimension (axis 1)
-        if self._aggregation == 'concat':
-            return np.concatenate(counts_list, axis=1)
-        elif self._aggregation == 'sum':
-            # test all counts_list have the same shape
-            assert all(counts_list[0].shape == c.shape for c in counts_list)
-            return np.sum(counts_list, axis=1)
+        all_counts = np.concatenate(counts_list, axis=1)
+        
+        if self._collapse_group:
+            # Collapse counts by group name
+            num_regions, _, region_size = all_counts.shape
+            collapsed_counts = np.zeros((num_regions, len(self._unique_group_names), region_size), dtype=np.int32)
+            
+            for i, indices in enumerate(self._group_indices_map.values()):
+                # Sum counts for the same group
+                collapsed_counts[:, i, :] = np.sum(all_counts[:, indices, :], axis=1)
+            
+            return collapsed_counts
         else:
-            raise ValueError(f"Invalid aggregation: {self._aggregation}")
+            return all_counts
