@@ -43,4 +43,6 @@ std::vector<Eigen::SparseMatrix<uint32_t>> load_matrix_memory_subset(
     uint32_t threads
 );
 
+std::vector<std::string> row_names_stored_matrix(std::string matrix_path);
+
 } // namespace BPCells::py

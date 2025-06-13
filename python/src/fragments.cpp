@@ -116,7 +116,7 @@ Eigen::MatrixXi pseudobulk_coverage(
 
     std::vector<uint32_t> cell_groups_uint;
     for (const auto &x : cell_groups) {
-        cell_groups_uint.push_back(x >= 0 ? x : num_groups + 1);
+        cell_groups_uint.push_back(x >= 0 ? x : num_groups);
     }
 
     frags = std::make_unique<CellMerge>(
@@ -249,23 +249,18 @@ static std::vector<uint64_t> precalculate_pseudobulk_coverage_helper(
         std::move(tile_mat), chunk_col_range.first, chunk_col_range.second
     );
 
-    // Track per-group sums in this chunk
+    // Track per-group sums in this chunk using efficient rowSums
     std::vector<uint64_t> group_sums(group_names.size(), 0);
     
-    // Use an alternative approach instead of clone() which doesn't exist
-    // Process the matrix directly for group sums
-    MatrixIterator<uint32_t> it(std::move(tile_mat));
+    // Use the efficient rowSums implementation from MatrixOps.h
+    std::vector<uint32_t> row_sums = tile_mat->rowSums(user_interrupt);
     
-    // Calculate running sums
-    while (it.nextCol()) {
-        while (it.nextValue()) {
-            if (it.row() < group_sums.size()) {
-                group_sums[it.row()] += it.val();
-            }
-        }
+    // Convert to uint64_t and ensure we don't exceed group bounds
+    for (size_t i = 0; i < row_sums.size() && i < group_sums.size(); i++) {
+        group_sums[i] = static_cast<uint64_t>(row_sums[i]);
     }
-    
-    // Reset the tile_mat since we moved it
+
+    // Reset the tile_mat since we moved it into the iterator
     FileReaderBuilder rb_new(fragments_path);
     auto frags_new = std::make_unique<StoredFragmentsPacked>(StoredFragmentsPacked::openPacked(rb_new));
     
@@ -276,7 +271,7 @@ static std::vector<uint64_t> precalculate_pseudobulk_coverage_helper(
         std::make_unique<VecStringReader>(group_names)
     );
     
-    // Properly construct TileMatrix (not a template)
+    // Properly construct TileMatrix
     tile_mat = std::make_unique<TileMatrix>(
         std::move(merged_frags), 
         chr_id,
@@ -284,7 +279,7 @@ static std::vector<uint64_t> precalculate_pseudobulk_coverage_helper(
         end,
         width,
         std::make_unique<VecStringReader>(chr_levels),
-        false // Use default value for preserve_zero
+        false
     );
     
     // Apply the same column slice
@@ -370,7 +365,7 @@ void precalculate_pseudobulk_coverage(
 
     std::vector<uint32_t> cell_groups_uint;
     for (const auto &x : cell_groups) {
-        cell_groups_uint.push_back(x >= 0 ? x : num_groups + 1);
+        cell_groups_uint.push_back(x >= 0 ? x : num_groups);
     }
 
     // Split columns into chunks
@@ -468,6 +463,16 @@ void precalculate_pseudobulk_coverage(
     }
     full_mat = std::make_unique<MatrixRowSelect<uint32_t>>(std::move(full_mat), row_selection);
     
+    // Set row names to group names using RenameDims
+    std::vector<std::string> row_names;
+    for (uint32_t i = 0; i < num_groups; i++) {
+        row_names.push_back(actual_group_names[i]);
+    }
+    std::vector<std::string> empty_col_names;
+    full_mat = std::make_unique<RenameDims<uint32_t>>(
+        std::move(full_mat), row_names, empty_col_names, false, true
+    );
+    
     FileWriterBuilder wb(output_path);
     
     run_with_py_interrupt_check(
@@ -489,38 +494,26 @@ void precalculate_pseudobulk_coverage(
         std_fs::create_directories(std_fs::path(output_path));
     }
     
-    // Write the library sizes to a binary file
-    std::string actual_library_size_path = (std_fs::path(output_path) / "library_size").string();
-    std::ofstream out_file(actual_library_size_path, std::ios::binary);
+    // Write library sizes to JSON format (now using efficient rowSums)
+    std::string library_size_path = (std_fs::path(output_path) / "library_size.json").string();
+    std::ofstream out_file(library_size_path);
     if (!out_file) {
-        throw std::runtime_error("Could not open file for writing library sizes: " + actual_library_size_path);
+        throw std::runtime_error("Could not open file for writing library sizes: " + library_size_path);
     }
     
-    // Write the number of groups
-    uint32_t size = final_group_sums.size();
-    out_file.write(reinterpret_cast<const char*>(&size), sizeof(size));
-    
-    // Write the library sizes
-    out_file.write(reinterpret_cast<const char*>(final_group_sums.data()), 
-                   final_group_sums.size() * sizeof(uint64_t));
-    
+    out_file << "{\n";
+    out_file << "  \"library_sizes\": [\n";
+    for (size_t i = 0; i < final_group_sums.size(); i++) {
+        out_file << "    " << final_group_sums[i];
+        if (i < final_group_sums.size() - 1) {
+            out_file << ",";
+        }
+        out_file << "\n";
+    }
+    out_file << "  ]\n";
+    out_file << "}\n";
     out_file.close();
     
-    // Write the group names to a JSON file
-    std::string group_names_path = (std_fs::path(output_path) / "group_names.json").string();
-    std::ofstream group_names_file(group_names_path);
-    if (group_names_file) {
-        group_names_file << "[\n";
-        for (size_t i = 0; i < num_groups; i++) {
-            group_names_file << "  \"" << actual_group_names[i] << "\"";
-            if (i < num_groups - 1) {
-                group_names_file << ",";
-            }
-            group_names_file << "\n";
-        }
-        group_names_file << "]\n";
-        group_names_file.close();
-    }
 }
 
 Eigen::MatrixXi query_precalculated_pseudobulk_coverage(

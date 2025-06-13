@@ -36,8 +36,8 @@ def import_10x_fragments(input: str, output: str, shift_start: int = 0, shift_en
     keeper_cells = np.asarray(keeper_cells) if keeper_cells is not None else keeper_cells
     bpcells.cpp.import_10x_fragments(input, output, shift_start, shift_end, keeper_cells)
 
-def build_cell_groups(fragments: str, cell_ids: Sequence[str], group_ids: Sequence[str], group_order: Sequence[str]) -> np.ndarray:
-    """Build cell_groups array for use in :func:`pseudobulk_insertion_counts()`
+def build_cell_groups(fragments: str, cell_ids: Sequence[str], group_ids: Sequence[str], group_order: Sequence[str]) -> pd.Categorical:
+    """Build cell_groups categorical for use in :func:`pseudobulk_insertion_counts()`
 
     Args:
         fragments (str): Path to BPCells fragments directory
@@ -46,27 +46,32 @@ def build_cell_groups(fragments: str, cell_ids: Sequence[str], group_ids: Sequen
         group_order (list[str]): Output order of pseudobulks (Contain the unique ``group_ids``)
     
     Returns:
-        numpy.ndarray: 
-        Numpy array suitable as input for ``cell_groups`` in :func:`pseudobulk_insertion_counts()`.
+        pd.Categorical: 
+        Pandas Categorical suitable as input for ``cell_groups`` in :func:`pseudobulk_insertion_counts()`.
         Same length as total number of cells in the ``fragments`` input, specifying the output
-        pseudobulk index for each cell (or -1 if the cell is excluded from consideration)
+        pseudobulk group for each cell (or NaN if the cell is excluded from consideration).
+        The categories are ordered according to ``group_order``.
         
     See Also:
         :func:`pseudobulk_insertion_counts`
     """
     cell_index_lookup = {c: i for i, c in enumerate(bpcells.cpp.cell_names_fragments_dir(fragments))}
-    group_index_lookup = {g: i for i, g in enumerate(group_order)}
     
     assert len(cell_ids) == len(group_ids)
-    assert set(group_ids) <= set(group_index_lookup.keys())
+    assert set(group_ids) <= set(group_order)
     
-    ret = np.full(len(cell_index_lookup), -1, np.int32)
+    # Create array of group assignments
+    all_cells = bpcells.cpp.cell_names_fragments_dir(fragments)
+    cell_groups = [None] * len(all_cells)
+    
     for cell_id, group_id in zip(cell_ids, group_ids):
-        ret[cell_index_lookup[cell_id]] = group_index_lookup[group_id]
+        if cell_id in cell_index_lookup:
+            cell_groups[cell_index_lookup[cell_id]] = group_id
     
-    return ret
+    # Create categorical with ordered categories
+    return pd.Categorical(cell_groups, categories=group_order, ordered=True)
 
-def pseudobulk_insertion_counts(fragments: str, regions: pd.DataFrame, cell_groups: Sequence[int], bin_size: int = 1) -> np.ndarray:
+def pseudobulk_insertion_counts(fragments: str, regions: pd.DataFrame, cell_groups: Union[Sequence[int], pd.Categorical], bin_size: int = 1) -> np.ndarray:
     """Calculate a pseudobulk coverage matrix
 
     Coverage is calculated as the number of start/end coordinates falling into a given position bin.
@@ -76,7 +81,8 @@ def pseudobulk_insertion_counts(fragments: str, regions: pd.DataFrame, cell_grou
         regions (pandas.DataFrame): Pandas dataframe with columns (``chrom``, ``start``, ``end``) representing
           genomic ranges (0-based, end-exclusive like BED format). All regions must be the same size.
           ``chrom`` should be a string column; ``start``/``end`` should be numeric.
-        cell_groups (list[int]): List of pseudbulk groupings as created by :func:`build_cell_groups()`
+        cell_groups (list[int] or pd.Categorical): List of pseudbulk groupings as created by :func:`build_cell_groups()`.
+          If pd.Categorical, group names are taken from the categories.
         bin_size (int): Size for bins within each region given in basepairs. If the region width is not
           an even multiple of ``resolution_bp``, then the last region may be truncated.
     
@@ -86,6 +92,14 @@ def pseudobulk_insertion_counts(fragments: str, regions: pd.DataFrame, cell_grou
     See Also: 
         :func:`build_cell_groups`
     """
+    # Convert pd.Categorical to integer array if needed
+    if isinstance(cell_groups, pd.Categorical):
+        # Convert to integer codes, with -1 for NaN values
+        cell_groups_array = cell_groups.codes.copy()
+        cell_groups_array[cell_groups_array == -1] = -1  # Ensure NaN becomes -1
+    else:
+        cell_groups_array = np.asarray(cell_groups)
+    
     chrs = bpcells.cpp.chr_names_fragments_dir(fragments)
 
     peak_order = sorted(
@@ -100,7 +114,7 @@ def pseudobulk_insertion_counts(fragments: str, regions: pd.DataFrame, cell_grou
         np.asarray(regions["chrom"]),
         np.asarray(regions["start"]),
         np.asarray(regions["end"]),
-        np.asarray(cell_groups),
+        cell_groups_array,
         bin_size
     )
     return mat.reshape((mat.shape[0], -1, regions.shape[0]), order="F").transpose(2,0,1)
@@ -114,24 +128,85 @@ class PrecalculatedInsertionMatrix:
     2^32-1 non-zero entries.
 
     Args:
-        dir (str): Path of the matrix directory
+        path (str or list[str]): Path of the matrix directory, or list of matrix directories to combine
         
     See Also:
         :func:`precalculate_insertion_counts`
     """
-    def __init__(self, path: str):
-        self._dir = str(os.path.abspath(os.path.expanduser(path)))
+    def __init__(self, path: Union[str, Sequence[str]]):
+        if isinstance(path, str):
+            # Single matrix mode
+            self._paths = [str(os.path.abspath(os.path.expanduser(path)))]
+            self._single_mode = True
+        else:
+            # Multiple matrix mode
+            self._paths = [str(os.path.abspath(os.path.expanduser(p))) for p in path]
+            self._single_mode = False
         
-        self._chrom_offsets = json.load(open(f"{self._dir}/chrom_offsets.json"))
-        self._library_size = self.load_library_sizes()
+        # Load chrom_offsets from the first matrix (should be the same for all)
+        self._chrom_offsets = json.load(open(f"{self._paths[0]}/chrom_offsets.json"))
+        
+        # Load library sizes from all matrices
+        self._library_sizes = []
+        self._all_group_names = []
+        for p in self._paths:
+            lib_size = self._load_library_sizes_single(p)
+            if lib_size is not None:
+                self._library_sizes.append(lib_size)
+            else:
+                self._library_sizes.append(np.array([]))
+            
+            # Get group names for this matrix
+            group_names = self._get_group_names_single(p)
+            self._all_group_names.extend(group_names)
+        
+        # Combine library sizes
+        if all(len(ls) > 0 for ls in self._library_sizes):
+            self._library_size = np.concatenate(self._library_sizes)
+        else:
+            self._library_size = np.array([])
+        
+        # Calculate combined shape
+        if self._single_mode:
+            first_shape = self._get_shape_single(self._paths[0])
+            self._combined_shape = first_shape
+        else:
+            total_pseudobulks = sum(self._get_shape_single(p)[0] for p in self._paths)
+            genome_size = self._get_shape_single(self._paths[0])[1]  # Should be same for all
+            self._combined_shape = (total_pseudobulks, genome_size)
 
+    def _get_shape_single(self, path: str) -> Tuple[int, int]:
+        """Get shape for a single matrix"""
+        return tuple(np.fromfile(f"{path}/shape", np.uint32, 2, offset=8))
+    
     @property
     def shape(self) -> Tuple[int, int]:
-        return tuple(np.fromfile(f"{self._dir}/shape", np.uint32, 2, offset=8))
+        return self._combined_shape
 
     @property
     def library_size(self) -> np.ndarray:
         return self._library_size
+    
+    def _get_group_names_single(self, path: str) -> List[str]:
+        """Get group names for a single matrix"""
+        # Try to get row names from the matrix
+        try:
+            # Read row names from the stored matrix
+            row_names = bpcells.cpp.row_names_stored_matrix(path)
+            if row_names and len(row_names) > 0 and any(name for name in row_names):
+                return row_names
+        except:
+            pass
+        
+        # Fall back to JSON file if matrix doesn't have row names
+        group_names_path = os.path.join(path, "group_names.json")
+        if os.path.exists(group_names_path):
+            with open(group_names_path, 'r') as f:
+                return json.load(f)
+        else:
+            # Fall back to numeric names if neither exists
+            shape = self._get_shape_single(path)
+            return [str(i) for i in range(shape[0])]
     
     @property
     def group_names(self) -> List[str]:
@@ -140,16 +215,13 @@ class PrecalculatedInsertionMatrix:
         Returns:
             list: List of group names in the same order as library_size
         """
-        group_names_path = os.path.join(self._dir, "group_names.json")
-        if os.path.exists(group_names_path):
-            with open(group_names_path, 'r') as f:
-                return json.load(f)
-        else:
-            # Fall back to numeric names if file doesn't exist
-            return [str(i) for i in range(len(self._library_size))]
+        return self._all_group_names
 
     def __repr__(self):
-        return f"<PrecalculatedInsertionMatrix with {self.shape[0]} pseudobulks and {len(self._chrom_offsets)} chromomsomes stored in \n\t{self._dir}"
+        if self._single_mode:
+            return f"<PrecalculatedInsertionMatrix with {self.shape[0]} pseudobulks and {len(self._chrom_offsets)} chromosomes stored in \n\t{self._paths[0]}"
+        else:
+            return f"<PrecalculatedInsertionMatrix with {self.shape[0]} total pseudobulks from {len(self._paths)} matrices>"
 
     def get_counts(self, regions: pd.DataFrame):
         """Load pseudobulk insertion counts
@@ -169,42 +241,77 @@ class PrecalculatedInsertionMatrix:
             self._chrom_offsets[t.chrom] + t.start for t in regions.itertuples()
         ]
         
-        return bpcells.cpp.query_precalculated_pseudobulk_coverage(
-            self._dir,
-            start_indices,
-            region_size
-        )\
-            .reshape((region_size, regions.shape[0], -1), order="F")\
-            .transpose((1,2,0))
-
-    def load_library_sizes(self) -> np.ndarray:
-        """Load library sizes (total insertion counts) from a binary file
-
-        Args:
-            filepath (str, optional): Path to the binary file containing library sizes.
-                If None, will try to use the standard 'library_size' file in the current directory.
+        if self._single_mode:
+            # Single matrix mode
+            return bpcells.cpp.query_precalculated_pseudobulk_coverage(
+                self._paths[0],
+                start_indices,
+                region_size
+            )\
+                .reshape((region_size, regions.shape[0], -1), order="F")\
+                .transpose((1,2,0))
+        else:
+            # Multiple matrix mode - get counts from each matrix and concatenate
+            counts_list = []
+            for path in self._paths:
+                counts = bpcells.cpp.query_precalculated_pseudobulk_coverage(
+                    path,
+                    start_indices,
+                    region_size
+                )\
+                    .reshape((region_size, regions.shape[0], -1), order="F")\
+                    .transpose((1,2,0))
+                counts_list.append(counts)
             
+            # Concatenate along pseudobulks dimension (axis 1)
+            return np.concatenate(counts_list, axis=1)
+
+    def _load_library_sizes_single(self, path: str) -> np.ndarray:
+        """Load library sizes from a single matrix directory"""
+        # Try JSON format first (new format)
+        json_filepath = os.path.join(path, "library_size.json")
+        if os.path.exists(json_filepath):
+            with open(json_filepath, 'r') as f:
+                data = json.load(f)
+                
+                # Handle enhanced JSON format (v1.1+) with rowSums optimization
+                if isinstance(data, dict):
+                    if "library_sizes" in data:
+                        return np.array(data["library_sizes"], dtype=np.uint64)
+                    else:
+                        raise ValueError("Invalid enhanced JSON format: missing library_sizes")
+                
+                else:
+                    raise ValueError("Invalid JSON format: expected dict or list")
+        
+        # Fall back to binary format (legacy)
+        binary_filepath = os.path.join(path, "library_size")
+        if os.path.exists(binary_filepath):
+            with open(binary_filepath, 'rb') as f:
+                # Read the number of groups (uint32)
+                size_bytes = f.read(4)
+                if len(size_bytes) < 4:
+                    raise ValueError("Invalid library size file format")
+                size = np.frombuffer(size_bytes, dtype=np.uint32)[0]
+                
+                # Read the library sizes (uint64 for each group)
+                data_bytes = f.read(size * 8)  # 8 bytes per uint64
+                if len(data_bytes) < size * 8:
+                    raise ValueError("Invalid library size file format")
+                return np.frombuffer(data_bytes, dtype=np.uint64)
+        
+        return None
+    
+    
+    def load_library_sizes(self) -> np.ndarray:
+        """Load library sizes (total insertion counts) - backward compatibility method
+
         Returns:
             numpy.ndarray: Array of library sizes (one value per group)
         """
-        # If no path provided, try the default location
-        filepath = os.path.join(self._dir, "library_size")
-        if not os.path.exists(filepath):
-            return None
-        with open(filepath, 'rb') as f:
-            # Read the number of groups (uint32)
-            size_bytes = f.read(4)
-            if len(size_bytes) < 4:
-                raise ValueError("Invalid library size file format")
-            size = np.frombuffer(size_bytes, dtype=np.uint32)[0]
-            
-            # Read the library sizes (uint64 for each group)
-            data_bytes = f.read(size * 8)  # 8 bytes per uint64
-            if len(data_bytes) < size * 8:
-                raise ValueError("Invalid library size file format")
-            return np.frombuffer(data_bytes, dtype=np.uint64)
+        return self._library_size
 
-def precalculate_insertion_counts(fragments: str, output_dir: str, cell_groups: Sequence[int], 
+def precalculate_insertion_counts(fragments: str, output_dir: str, cell_groups: Union[Sequence[int], pd.Categorical], 
                                  chrom_sizes: Union[str, Dict[str, int]], threads: int = 0,
                                  group_names: Optional[List[str]] = None):
     """Precalculate per-base insertion counts from fragment data
@@ -215,10 +322,12 @@ def precalculate_insertion_counts(fragments: str, output_dir: str, cell_groups: 
     Args:
         fragments (str): Path to a BPCells fragments directory
         output_dir (str): Path to save the insertion counts in
-        cell_groups (list[int]): List of pseudbulk groupings as created by :func:`build_cell_groups()`
+        cell_groups (list[int] or pd.Categorical): List of pseudbulk groupings as created by :func:`build_cell_groups()`.
+            If pd.Categorical, group names are taken from the categories.
         chrom_sizes (str | dict[str, int]): Path/URL of UCSC-style chrom.sizes file, or dictionary mapping chromosome names to sizes
         threads (int): Number of threads to use during matrix calculation (default = 1)
-        group_names (list[str], optional): Names for each group in the same order as group indices (0, 1, 2, ...)
+        group_names (list[str], optional): Names for each group in the same order as group indices (0, 1, 2, ...).
+            Ignored if cell_groups is pd.Categorical.
     
     Returns:
         A :class:`PrecalculatedInsertionMatrix` object
@@ -226,6 +335,17 @@ def precalculate_insertion_counts(fragments: str, output_dir: str, cell_groups: 
     See Also:
         :class:`PrecalculatedInsertionMatrix`
     """
+    # Handle pd.Categorical input
+    if isinstance(cell_groups, pd.Categorical):
+        # Extract group names from categorical only if not provided by user
+        if group_names is None:
+            group_names = list(cell_groups.categories)
+        # Convert to integer array
+        cell_groups_array = cell_groups.codes.astype(np.int32)
+        cell_groups_array[cell_groups_array == -1] = -1  # Ensure NaN becomes -1
+    else:
+        cell_groups_array = cell_groups
+    
     if isinstance(chrom_sizes, str):
         chrom_sizes = pd.read_csv(chrom_sizes, sep="\t", names=["chrom", "size"])
         chrom_sizes = {t.chrom: t.size for t in chrom_sizes.itertuples()}
@@ -242,7 +362,7 @@ def precalculate_insertion_counts(fragments: str, output_dir: str, cell_groups: 
         tmp.name,
         list(chrom_sizes.keys()),
         list(chrom_sizes.values()),
-        cell_groups,
+        cell_groups_array,
         1,
         threads,
         group_names
@@ -252,118 +372,3 @@ def precalculate_insertion_counts(fragments: str, output_dir: str, cell_groups: 
     json.dump(chrom_offsets, open(f"{output_dir}/chrom_offsets.json", "w"), indent=2)
     return PrecalculatedInsertionMatrix(output_dir)
 
-class MultiPrecalculatedInsertionMatrix:
-    """
-    Wrapper class that combines multiple PrecalculatedInsertionMatrix objects
-    
-    This allows loading and querying counts from multiple insertion matrices and concatenating
-    the results along the pseudobulks dimension (dimension 1 in (region, pseudobulks, position)).
-    
-    Args:
-        matrices (list[Union[str, PrecalculatedInsertionMatrix]]): List of PrecalculatedInsertionMatrix objects
-            or paths to matrix directories
-        collapse_group (bool): If True, automatically sum up library sizes and counts for groups with
-            the same name. Default is False.
-    """
-    def __init__(self, matrices: List[Union[str, "PrecalculatedInsertionMatrix"]], collapse_group: bool = False):
-        self._matrices = [
-            m if isinstance(m, PrecalculatedInsertionMatrix) else PrecalculatedInsertionMatrix(m)
-            for m in matrices
-        ]
-        self._chrom_offsets = self._matrices[0]._chrom_offsets
-        self._collapse_group = collapse_group
-        
-        # Collect all group names from all matrices
-        all_group_names = []
-        for m in self._matrices:
-            all_group_names.extend(m.group_names)
-        
-        # Collect all library sizes from all matrices
-        all_library_sizes = np.concatenate([m.library_size for m in self._matrices])
-        
-        if collapse_group:
-            # Create mapping from unique group names to their original indices
-            self._unique_group_names = []
-            self._group_indices_map = {}
-            
-            for i, name in enumerate(all_group_names):
-                if name not in self._group_indices_map:
-                    self._group_indices_map[name] = []
-                    self._unique_group_names.append(name)
-                self._group_indices_map[name].append(i)
-            
-            # Calculate combined library size by summing up sizes for the same group
-            self._combined_library_size = np.array([
-                np.sum(all_library_sizes[indices]) for indices in self._group_indices_map.values()
-            ])
-            
-            # Combined shape with unique groups
-            self._combined_shape = (
-                len(self._unique_group_names),  # Number of unique groups
-                self._matrices[0].shape[1]      # Genome size (should be the same for all)
-            )
-            
-            self._combined_group_names = self._unique_group_names
-        else:
-            # Calculate combined shape
-            self._combined_shape = (
-                sum(m.shape[0] for m in self._matrices),  # Sum of pseudobulks
-                self._matrices[0].shape[1]                # Genome size (should be the same for all)
-            )
-            
-            self._combined_group_names = all_group_names
-            self._combined_library_size = all_library_sizes
-        
-    @property
-    def shape(self) -> Tuple[int, int]:
-        return self._combined_shape
-    
-    @property
-    def library_size(self) -> np.ndarray:
-        return self._combined_library_size
-    
-    @property
-    def group_names(self) -> List[str]:
-        """Return the combined group names for all pseudobulks
-        
-        Returns:
-            list: List of group names in the same order as library_size
-        """
-        return self._combined_group_names
-    
-    def __repr__(self):
-        if self._collapse_group:
-            return f"<MultiPrecalculatedInsertionMatrix with {self.shape[0]} unique groups (collapsed) from {len(self._matrices)} matrices>"
-        else:
-            return f"<MultiPrecalculatedInsertionMatrix with {self.shape[0]} total pseudobulks from {len(self._matrices)} matrices>"
-    
-    def get_counts(self, regions: pd.DataFrame) -> np.ndarray:
-        """Load pseudobulk insertion counts from all matrices
-        
-        Args:
-            regions (pandas.DataFrame): Pandas dataframe with columns (``chrom``, ``start``, ``end``) representing
-                genomic ranges (0-based, end-exclusive like BED format). All regions must be the same size.
-                ``chrom`` should be a string column; ``start``/``end`` should be numeric.
-        
-        Returns:
-            numpy.ndarray: Numpy array of dimensions (region, psudobulks, position) and type numpy.int32
-            where pseudobulks dimension is concatenated from all matrices
-        """
-        # Get counts from each matrix
-        counts_list = [m.get_counts(regions) for m in self._matrices]
-        
-        # Concatenate along pseudobulks dimension (axis 1)
-        all_counts = np.concatenate(counts_list, axis=1)
-        
-        if self._collapse_group:
-            # Collapse counts by group name
-            num_regions, _, region_size = all_counts.shape
-            collapsed_counts = np.zeros((num_regions, len(self._unique_group_names), region_size), dtype=np.int32)
-            
-            for i, indices in enumerate(self._group_indices_map.values()):
-                # Sum counts for the same group
-                collapsed_counts[:, i, :] = np.sum(all_counts[:, indices, :], axis=1)
-            
-            return collapsed_counts
-        else:
-            return all_counts

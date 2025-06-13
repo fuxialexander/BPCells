@@ -18,6 +18,7 @@
 #include <utility>
 
 #include <Eigen/SparseCore>
+#include "bpcells-cpp/matrixIterators/StoredMatrixSparseColumn.h"
 
 #include "bpcells-cpp/arrayIO/binaryfile.h"
 #include "bpcells-cpp/arrayIO/vector.h"
@@ -259,6 +260,23 @@ std::tuple<uint32_t, uint32_t> dims_matrix_dir(std::string matrix_path) {
         std::make_unique<StoredMatrix<uint32_t>>(StoredMatrix<uint32_t>::openPacked(rb));
 
     return {mat->rows(), mat->cols()};
+}
+
+std::vector<std::string> row_names_stored_matrix(std::string matrix_path) {
+    FileReaderBuilder rb(matrix_path);
+    std::unique_ptr<MatrixLoader<uint32_t>> mat =
+        std::make_unique<StoredMatrix<uint32_t>>(EXPERIMENTAL_openPackedSparseColumn<uint32_t>(rb));
+
+    std::vector<std::string> row_names;
+    for (uint32_t i = 0; i < mat->rows(); i++) {
+        const char* name = mat->rowNames(i);
+        if (name != nullptr) {
+            row_names.push_back(std::string(name));
+        } else {
+            row_names.push_back("");
+        }
+    }
+    return row_names;
 }
 
 } // namespace BPCells::py

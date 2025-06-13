@@ -47,6 +47,7 @@ PYBIND11_MODULE(cpp, m) {
     
     m.def("load_matrix_dir_subset", &BPCells::py::load_matrix_dir_subset);
     m.def("dims_matrix_dir", &BPCells::py::dims_matrix_dir);
+    m.def("row_names_stored_matrix", &BPCells::py::row_names_stored_matrix);
 
     m.def("load_matrix_dir_to_memory", &BPCells::py::load_matrix_dir_to_memory);
     m.def("load_matrix_memory_subset", &BPCells::py::load_matrix_memory_subset);
