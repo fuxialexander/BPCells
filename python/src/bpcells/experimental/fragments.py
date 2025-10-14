@@ -36,38 +36,48 @@ def import_10x_fragments(input: str, output: str, shift_start: int = 0, shift_en
     keeper_cells = np.asarray(keeper_cells) if keeper_cells is not None else keeper_cells
     bpcells.cpp.import_10x_fragments(input, output, shift_start, shift_end, keeper_cells)
 
-def build_cell_groups(fragments: str, cell_ids: Sequence[str], group_ids: Sequence[str], group_order: Sequence[str]) -> pd.Categorical:
+def build_cell_groups(fragments: Union[str, List[str]], cell_ids: Sequence[str], group_ids: Sequence[str], group_order: Sequence[str]) -> pd.Categorical:
     """Build cell_groups categorical for use in :func:`pseudobulk_insertion_counts()`
 
     Args:
-        fragments (str): Path to BPCells fragments directory
+        fragments (str | list[str]): Path to BPCells fragments directory, or list of paths to multiple fragment directories
         cell_ids (list[str]): List of cell IDs
         group_ids (list[str]): List of pseudobulk IDs for each cell (same length as ``cell_ids``)
         group_order (list[str]): Output order of pseudobulks (Contain the unique ``group_ids``)
-    
+
     Returns:
-        pd.Categorical: 
+        pd.Categorical:
         Pandas Categorical suitable as input for ``cell_groups`` in :func:`pseudobulk_insertion_counts()`.
         Same length as total number of cells in the ``fragments`` input, specifying the output
         pseudobulk group for each cell (or NaN if the cell is excluded from consideration).
+        When using multiple fragment files, the categorical covers all cells across all files.
         The categories are ordered according to ``group_order``.
-        
+
     See Also:
         :func:`pseudobulk_insertion_counts`
     """
-    cell_index_lookup = {c: i for i, c in enumerate(bpcells.cpp.cell_names_fragments_dir(fragments))}
-    
+    # Convert single path to list for uniform handling
+    if isinstance(fragments, str):
+        fragments = [fragments]
+
+    # Build cell index lookup across all fragment files
+    cell_index_lookup = {}
+    current_index = 0
+    for frag_path in fragments:
+        for cell_name in bpcells.cpp.cell_names_fragments_dir(frag_path):
+            cell_index_lookup[cell_name] = current_index
+            current_index += 1
+
     assert len(cell_ids) == len(group_ids)
     assert set(group_ids) <= set(group_order)
-    
+
     # Create array of group assignments
-    all_cells = bpcells.cpp.cell_names_fragments_dir(fragments)
-    cell_groups = [None] * len(all_cells)
-    
+    cell_groups = [None] * len(cell_index_lookup)
+
     for cell_id, group_id in zip(cell_ids, group_ids):
         if cell_id in cell_index_lookup:
             cell_groups[cell_index_lookup[cell_id]] = group_id
-    
+
     # Create categorical with ordered categories
     return pd.Categorical(cell_groups, categories=group_order, ordered=True)
 
@@ -311,7 +321,7 @@ class PrecalculatedInsertionMatrix:
         """
         return self._library_size
 
-def precalculate_insertion_counts(fragments: str, output_dir: str, cell_groups: Union[Sequence[int], pd.Categorical], 
+def precalculate_insertion_counts(fragments: Union[str, List[str]], output_dir: str, cell_groups: Union[Sequence[int], pd.Categorical],
                                  chrom_sizes: Union[str, Dict[str, int]], threads: int = 0,
                                  group_names: Optional[List[str]] = None):
     """Precalculate per-base insertion counts from fragment data
@@ -320,21 +330,27 @@ def precalculate_insertion_counts(fragments: str, output_dir: str, cell_groups: 
     2^32-1 non-zero entries.
 
     Args:
-        fragments (str): Path to a BPCells fragments directory
+        fragments (str | list[str]): Path to a BPCells fragments directory, or list of paths to multiple fragment directories
         output_dir (str): Path to save the insertion counts in
         cell_groups (list[int] or pd.Categorical): List of pseudbulk groupings as created by :func:`build_cell_groups()`.
+            When using multiple fragment files, the cell_groups should index across all files combined
+            (e.g., if file1 has 100 cells and file2 has 150 cells, cell_groups should have length 250).
             If pd.Categorical, group names are taken from the categories.
         chrom_sizes (str | dict[str, int]): Path/URL of UCSC-style chrom.sizes file, or dictionary mapping chromosome names to sizes
         threads (int): Number of threads to use during matrix calculation (default = 1)
         group_names (list[str], optional): Names for each group in the same order as group indices (0, 1, 2, ...).
             Ignored if cell_groups is pd.Categorical.
-    
+
     Returns:
         A :class:`PrecalculatedInsertionMatrix` object
 
     See Also:
         :class:`PrecalculatedInsertionMatrix`
     """
+    # Convert single path to list for uniform handling
+    if isinstance(fragments, str):
+        fragments = [fragments]
+
     # Handle pd.Categorical input
     if isinstance(cell_groups, pd.Categorical):
         # Extract group names from categorical only if not provided by user
@@ -345,13 +361,13 @@ def precalculate_insertion_counts(fragments: str, output_dir: str, cell_groups: 
         cell_groups_array[cell_groups_array == -1] = -1  # Ensure NaN becomes -1
     else:
         cell_groups_array = cell_groups
-    
+
     if isinstance(chrom_sizes, str):
         chrom_sizes = pd.read_csv(chrom_sizes, sep="\t", names=["chrom", "size"])
         chrom_sizes = {t.chrom: t.size for t in chrom_sizes.itertuples()}
-    
-    # Re-order chrom_sizes to match the fragment file chromosome order
-    chrom_order = bpcells.cpp.chr_names_fragments_dir(fragments)
+
+    # Re-order chrom_sizes to match the fragment file chromosome order (use first file as reference)
+    chrom_order = bpcells.cpp.chr_names_fragments_dir(fragments[0])
     chrom_sizes = dict(i for i in chrom_sizes.items() if i[0] in chrom_order)
     chrom_sizes = dict(sorted(chrom_sizes.items(), key = lambda x: chrom_order.index(x[0])))
 
@@ -367,7 +383,7 @@ def precalculate_insertion_counts(fragments: str, output_dir: str, cell_groups: 
         threads,
         group_names
     )
-    
+
     chrom_offsets = dict(zip(chrom_sizes.keys(), [0] + np.cumsum(list(chrom_sizes.values()))[:-1].tolist()))
     json.dump(chrom_offsets, open(f"{output_dir}/chrom_offsets.json", "w"), indent=2)
     return PrecalculatedInsertionMatrix(output_dir)

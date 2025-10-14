@@ -40,7 +40,7 @@ Eigen::MatrixXi pseudobulk_coverage(
 
 // Calculate an experimental CompressedSparseColumn matrix
 void precalculate_pseudobulk_coverage(
-    std::string fragments_path,
+    std::vector<std::string> fragments_paths,
     std::string output_path,
     std::string tmp_path,
     std::vector<std::string> chr,

@@ -15,6 +15,7 @@
 #include "bpcells-cpp/arrayIO/vector.h"
 #include "bpcells-cpp/fragmentIterators/BedFragments.h"
 #include "bpcells-cpp/fragmentIterators/CellSelect.h"
+#include "bpcells-cpp/fragmentIterators/MergeFragments.h"
 #include "bpcells-cpp/fragmentIterators/ShiftCoords.h"
 #include "bpcells-cpp/fragmentIterators/StoredFragments.h"
 #include "bpcells-cpp/matrixIterators/ConcatenateMatrix.h"
@@ -215,7 +216,7 @@ void parallel_map_helper(std::vector<std::future<T>> &futures, size_t threads, s
 
 // Write a chunk of the tile matrix columns to the given output path
 static std::vector<uint64_t> precalculate_pseudobulk_coverage_helper(
-    std::string fragments_path,
+    const std::vector<std::string> &fragments_paths,
     std::string chunk_output_path,
     std::pair<uint32_t, uint32_t> chunk_col_range,
 
@@ -230,9 +231,24 @@ static std::vector<uint64_t> precalculate_pseudobulk_coverage_helper(
 
     std::atomic<bool> *user_interrupt
 ) {
-    FileReaderBuilder rb(fragments_path);
-    std::unique_ptr<FragmentLoader> frags =
-        std::make_unique<StoredFragmentsPacked>(StoredFragmentsPacked::openPacked(rb));
+    std::unique_ptr<FragmentLoader> frags;
+
+    // Load fragments from single or multiple paths
+    if (fragments_paths.size() == 1) {
+        // Single fragment file
+        FileReaderBuilder rb(fragments_paths[0]);
+        frags = std::make_unique<StoredFragmentsPacked>(StoredFragmentsPacked::openPacked(rb));
+    } else {
+        // Multiple fragment files - use MergeFragments
+        std::vector<std::unique_ptr<FragmentLoader>> frag_loaders;
+        for (const auto& path : fragments_paths) {
+            FileReaderBuilder rb(path);
+            frag_loaders.push_back(
+                std::make_unique<StoredFragmentsPacked>(StoredFragmentsPacked::openPacked(rb))
+            );
+        }
+        frags = std::make_unique<MergeFragments>(std::move(frag_loaders), chr_levels);
+    }
 
     // Merge cells
     frags = std::make_unique<CellMerge>(
@@ -261,13 +277,27 @@ static std::vector<uint64_t> precalculate_pseudobulk_coverage_helper(
     }
 
     // Reset the tile_mat since we moved it into the iterator
-    FileReaderBuilder rb_new(fragments_path);
-    auto frags_new = std::make_unique<StoredFragmentsPacked>(StoredFragmentsPacked::openPacked(rb_new));
-    
+    std::unique_ptr<FragmentLoader> frags_new;
+
+    // Reload fragments from single or multiple paths
+    if (fragments_paths.size() == 1) {
+        FileReaderBuilder rb_new(fragments_paths[0]);
+        frags_new = std::make_unique<StoredFragmentsPacked>(StoredFragmentsPacked::openPacked(rb_new));
+    } else {
+        std::vector<std::unique_ptr<FragmentLoader>> frag_loaders_new;
+        for (const auto& path : fragments_paths) {
+            FileReaderBuilder rb(path);
+            frag_loaders_new.push_back(
+                std::make_unique<StoredFragmentsPacked>(StoredFragmentsPacked::openPacked(rb))
+            );
+        }
+        frags_new = std::make_unique<MergeFragments>(std::move(frag_loaders_new), chr_levels);
+    }
+
     // Create a new CellMerge object
     auto merged_frags = std::make_unique<CellMerge>(
-        std::move(frags_new), 
-        group_ids, 
+        std::move(frags_new),
+        group_ids,
         std::make_unique<VecStringReader>(group_names)
     );
     
@@ -301,7 +331,7 @@ static std::vector<uint64_t> precalculate_pseudobulk_coverage_helper(
 }
 
 void precalculate_pseudobulk_coverage(
-    std::string fragments_path,
+    std::vector<std::string> fragments_paths,
     std::string output_path,
     std::string tmp_path,
     std::vector<std::string> chr,
@@ -319,10 +349,17 @@ void precalculate_pseudobulk_coverage(
         );
     }
 
+    if (fragments_paths.empty()) {
+        throw std::runtime_error(
+            "precalculate_pseudobulk_coverage: fragments_paths cannot be empty"
+        );
+    }
+
     std::vector<uint32_t> start(chr.size(), 0);
     std::vector<uint32_t> tile_width(chr.size(), bin_size);
 
-    FileReaderBuilder rb(fragments_path);
+    // Get chromosome names from the first fragment file
+    FileReaderBuilder rb(fragments_paths[0]);
     auto frags = StoredFragmentsPacked::openPacked(rb);
 
     std::vector<uint32_t> chr_id;
@@ -389,9 +426,9 @@ void precalculate_pseudobulk_coverage(
 
     // Vector to store group sums from all chunks
     std::vector<std::vector<uint64_t>> all_group_sums;
-    
+
     // Make all the matrix chunks
-    run_with_py_interrupt_check([&fragments_path,
+    run_with_py_interrupt_check([&fragments_paths,
                                         &chunk_output_paths,
                                         &chunk_col_splits,
                                         &cell_groups_uint,
@@ -406,12 +443,12 @@ void precalculate_pseudobulk_coverage(
                                         chunks](std::atomic<bool> *user_interrupt) {
         std::vector<std::future<std::vector<uint64_t>>> task_vec;
         all_group_sums.resize(chunks);
-        
+
         for (size_t i = 0; i < chunks; i++) {
             task_vec.push_back(std::async(
                 std::launch::deferred,
                 &precalculate_pseudobulk_coverage_helper,
-                fragments_path,
+                std::cref(fragments_paths),
                 chunk_output_paths[i],
                 chunk_col_splits[i],
 
