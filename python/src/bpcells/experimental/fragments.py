@@ -186,24 +186,25 @@ def build_cell_groups(
                 cell_groups[global_idx] = frag_cell_maps[frag_path][cell_name]
             # If no match, cell_groups[global_idx] remains None (cell excluded)
     else:
-        # List-based API: sequential matching (original behavior)
+        # List-based API: name-based lookup (backward compatible)
         # Validate that all group_ids are in group_order
         unique_groups = set(group_ids)
         if not unique_groups <= set(group_order):
             missing = unique_groups - set(group_order)
             raise ValueError(f"group_ids contains groups not in group_order: {missing}")
         
-        # Match cell_ids sequentially with cell_sequence
-        # This is O(total_cells) which is optimal - we iterate through all cells once
-        # Duplicate barcodes from different fragments are handled correctly because we match in order
-        # cell_ids should be in the same order as cells appear across fragments
-        cell_id_idx = 0
+        # Create name-based lookup: cell_id -> group_id
+        # This preserves backward compatibility - cells can be in any order
+        # For single fragment, this works correctly
+        # For multiple fragments with list-based API, we warn but still use name-based lookup
+        # (duplicate barcodes across fragments will get the same group_id from the first match)
+        cell_to_group = dict(zip(cell_ids, group_ids))
+        
+        # Match cells using name-based lookup
         for frag_path, cell_name, global_idx in cell_sequence:
-            if cell_id_idx < len(cell_ids) and cell_ids[cell_id_idx] == cell_name:
+            if cell_name in cell_to_group:
                 # Match found - assign the corresponding group_id
-                # This handles duplicate barcodes correctly because we match in order
-                cell_groups[global_idx] = group_ids[cell_id_idx]
-                cell_id_idx += 1
+                cell_groups[global_idx] = cell_to_group[cell_name]
             # If no match, cell_groups[global_idx] remains None (cell excluded)
 
     # Create categorical with ordered categories
