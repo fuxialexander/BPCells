@@ -12,6 +12,7 @@ import bpcells.cpp
 import json
 import tempfile
 import os.path
+import warnings
 
 from typing import Dict, List, Optional, Tuple, Union
 import sys
@@ -36,14 +37,29 @@ def import_10x_fragments(input: str, output: str, shift_start: int = 0, shift_en
     keeper_cells = np.asarray(keeper_cells) if keeper_cells is not None else keeper_cells
     bpcells.cpp.import_10x_fragments(input, output, shift_start, shift_end, keeper_cells)
 
-def build_cell_groups(fragments: Union[str, List[str]], cell_ids: Sequence[str], group_ids: Sequence[str], group_order: Sequence[str]) -> pd.Categorical:
+def build_cell_groups(
+    fragments: Union[str, List[str]], 
+    cell_ids: Union[Sequence[str], Dict[str, Sequence[str]]], 
+    group_ids: Union[Sequence[str], Dict[str, Sequence[str]]], 
+    group_order: Sequence[str]
+) -> pd.Categorical:
     """Build cell_groups categorical for use in :func:`pseudobulk_insertion_counts()`
 
     Args:
         fragments (str | list[str]): Path to BPCells fragments directory, or list of paths to multiple fragment directories
-        cell_ids (list[str]): List of cell IDs
-        group_ids (list[str]): List of pseudobulk IDs for each cell (same length as ``cell_ids``)
-        group_order (list[str]): Output order of pseudobulks (Contain the unique ``group_ids``)
+        cell_ids (list[str] | dict[str, list[str]]): 
+            - If list: List of cell IDs. **Only supported for single fragment files.**
+              Will raise a warning if used with multiple fragments.
+            - If dict: Mapping from fragment path to list of cell IDs for that fragment.
+              Keys must match paths in ``fragments``. **Required for multiple fragments**
+              to clearly specify which cells belong to which fragment file.
+        group_ids (list[str] | dict[str, list[str]]): 
+            - If list: List of pseudobulk IDs for each cell (same length as ``cell_ids``).
+              **Only supported for single fragment files.**
+            - If dict: Mapping from fragment path to list of group IDs for that fragment.
+              Keys must match paths in ``fragments``. Each value must have same length as
+              corresponding ``cell_ids[path]``. **Required for multiple fragments.**
+        group_order (list[str]): Output order of pseudobulks (must contain all unique ``group_ids``)
 
     Returns:
         pd.Categorical:
@@ -53,30 +69,142 @@ def build_cell_groups(fragments: Union[str, List[str]], cell_ids: Sequence[str],
         When using multiple fragment files, the categorical covers all cells across all files.
         The categories are ordered according to ``group_order``.
 
+    Examples:
+        Single fragment (list-based API):
+        >>> cell_groups = build_cell_groups(
+        ...     fragments="/path/to/fragments",
+        ...     cell_ids=["cell1", "cell2", "cell3"],
+        ...     group_ids=["groupA", "groupA", "groupB"],
+        ...     group_order=["groupA", "groupB"]
+        ... )
+
+        Multiple fragments (dict-based API - recommended):
+        >>> cell_groups = build_cell_groups(
+        ...     fragments=["/path/to/frag1", "/path/to/frag2"],
+        ...     cell_ids={
+        ...         "/path/to/frag1": ["cell1", "cell2"],
+        ...         "/path/to/frag2": ["cell3", "cell4"]
+        ...     },
+        ...     group_ids={
+        ...         "/path/to/frag1": ["groupA", "groupA"],
+        ...         "/path/to/frag2": ["groupB", "groupB"]
+        ...     },
+        ...     group_order=["groupA", "groupB"]
+        ... )
+
     See Also:
         :func:`pseudobulk_insertion_counts`
     """
     # Convert single path to list for uniform handling
     if isinstance(fragments, str):
         fragments = [fragments]
+    
+    # Normalize fragment paths to absolute paths for consistent matching
+    fragments_normalized = [os.path.abspath(os.path.expanduser(f)) for f in fragments]
+
+    # Determine if using dict-based API (for multiple fragments) or list-based API
+    using_dict_api = isinstance(cell_ids, dict)
+    
+    # Warn if list-based API is used with multiple fragments
+    if not using_dict_api and len(fragments_normalized) > 1:
+        warnings.warn(
+            "List-based API (cell_ids as list) should only be used with a single fragment file. "
+            "For multiple fragments, use the dict-based API where cell_ids and group_ids are dicts "
+            "mapping fragment paths to cell/group lists. This ensures correct cell-to-fragment "
+            "mapping and avoids ordering errors.",
+            UserWarning,
+            stacklevel=2
+        )
+    
+    if using_dict_api:
+        # Dict-based API: cell_ids and group_ids are dicts mapping fragment path -> list
+        if not isinstance(group_ids, dict):
+            raise TypeError("When cell_ids is a dict, group_ids must also be a dict")
+        
+        # Normalize dict keys to absolute paths
+        cell_ids_normalized = {os.path.abspath(os.path.expanduser(k)): v for k, v in cell_ids.items()}
+        group_ids_normalized = {os.path.abspath(os.path.expanduser(k)): v for k, v in group_ids.items()}
+        
+        # Validate that all fragment paths have corresponding entries
+        missing_frags = set(fragments_normalized) - set(cell_ids_normalized.keys())
+        if missing_frags:
+            raise ValueError(f"Missing cell_ids entries for fragments: {missing_frags}")
+        missing_frags = set(fragments_normalized) - set(group_ids_normalized.keys())
+        if missing_frags:
+            raise ValueError(f"Missing group_ids entries for fragments: {missing_frags}")
+        
+        # Validate lengths match for each fragment
+        for frag_path in fragments_normalized:
+            if len(cell_ids_normalized[frag_path]) != len(group_ids_normalized[frag_path]):
+                raise ValueError(
+                    f"cell_ids and group_ids must have same length for fragment {frag_path}. "
+                    f"Got {len(cell_ids_normalized[frag_path])} and {len(group_ids_normalized[frag_path])}"
+                )
+    else:
+        # List-based API: cell_ids and group_ids are sequences
+        if isinstance(group_ids, dict):
+            raise TypeError("When cell_ids is a list, group_ids must also be a list")
+        if len(cell_ids) != len(group_ids):
+            raise ValueError(f"cell_ids and group_ids must have same length. Got {len(cell_ids)} and {len(group_ids)}")
 
     # Build cell index lookup across all fragment files
-    cell_index_lookup = {}
+    # Track cells in order across fragments to preserve fragment context for duplicate barcodes
+    # Sequential matching is O(total_cells) which is optimal since we iterate through all cells anyway
+    cell_sequence = []  # List of (frag_path, cell_name, global_index) in order across all fragments
     current_index = 0
-    for frag_path in fragments:
+    for frag_path in fragments_normalized:
         for cell_name in bpcells.cpp.cell_names_fragments_dir(frag_path):
-            cell_index_lookup[cell_name] = current_index
+            cell_sequence.append((frag_path, cell_name, current_index))
             current_index += 1
 
-    assert len(cell_ids) == len(group_ids)
-    assert set(group_ids) <= set(group_order)
+    # Total number of cells across all fragments
+    total_cells = current_index
 
     # Create array of group assignments
-    cell_groups = [None] * len(cell_index_lookup)
+    cell_groups = [None] * total_cells
 
-    for cell_id, group_id in zip(cell_ids, group_ids):
-        if cell_id in cell_index_lookup:
-            cell_groups[cell_index_lookup[cell_id]] = group_id
+    if using_dict_api:
+        # Dict-based API: match cells per fragment
+        # Create lookup maps for each fragment
+        frag_cell_maps = {}
+        for frag_path in fragments_normalized:
+            # Create a set for fast lookup, but preserve order for validation
+            cell_list = list(cell_ids_normalized[frag_path])
+            group_list = list(group_ids_normalized[frag_path])
+            frag_cell_maps[frag_path] = dict(zip(cell_list, group_list))
+            
+            # Validate that all group_ids are in group_order
+            unique_groups = set(group_list)
+            if not unique_groups <= set(group_order):
+                missing = unique_groups - set(group_order)
+                raise ValueError(f"group_ids contains groups not in group_order: {missing}")
+        
+        # Match cells using fragment-specific lookup
+        for frag_path, cell_name, global_idx in cell_sequence:
+            if frag_path in frag_cell_maps and cell_name in frag_cell_maps[frag_path]:
+                # Match found - assign the corresponding group_id
+                cell_groups[global_idx] = frag_cell_maps[frag_path][cell_name]
+            # If no match, cell_groups[global_idx] remains None (cell excluded)
+    else:
+        # List-based API: sequential matching (original behavior)
+        # Validate that all group_ids are in group_order
+        unique_groups = set(group_ids)
+        if not unique_groups <= set(group_order):
+            missing = unique_groups - set(group_order)
+            raise ValueError(f"group_ids contains groups not in group_order: {missing}")
+        
+        # Match cell_ids sequentially with cell_sequence
+        # This is O(total_cells) which is optimal - we iterate through all cells once
+        # Duplicate barcodes from different fragments are handled correctly because we match in order
+        # cell_ids should be in the same order as cells appear across fragments
+        cell_id_idx = 0
+        for frag_path, cell_name, global_idx in cell_sequence:
+            if cell_id_idx < len(cell_ids) and cell_ids[cell_id_idx] == cell_name:
+                # Match found - assign the corresponding group_id
+                # This handles duplicate barcodes correctly because we match in order
+                cell_groups[global_idx] = group_ids[cell_id_idx]
+                cell_id_idx += 1
+            # If no match, cell_groups[global_idx] remains None (cell excluded)
 
     # Create categorical with ordered categories
     return pd.Categorical(cell_groups, categories=group_order, ordered=True)
@@ -332,10 +460,26 @@ def precalculate_insertion_counts(fragments: Union[str, List[str]], output_dir: 
     Args:
         fragments (str | list[str]): Path to a BPCells fragments directory, or list of paths to multiple fragment directories
         output_dir (str): Path to save the insertion counts in
-        cell_groups (list[int] or pd.Categorical): List of pseudbulk groupings as created by :func:`build_cell_groups()`.
+        cell_groups (list[int] or pd.Categorical): Pseudobulk groupings as created by :func:`build_cell_groups()`.
+            Should be the output of :func:`build_cell_groups()` to ensure correct cell-to-fragment mapping.
             When using multiple fragment files, the cell_groups should index across all files combined
             (e.g., if file1 has 100 cells and file2 has 150 cells, cell_groups should have length 250).
             If pd.Categorical, group names are taken from the categories.
+            
+            **Important**: When using multiple fragments, create `cell_groups` using the dict-based API
+            in :func:`build_cell_groups()` to ensure correct mapping:
+            
+            >>> cell_groups = build_cell_groups(
+            ...     fragments=["/path/to/frag1", "/path/to/frag2"],
+            ...     cell_ids={"/path/to/frag1": [...], "/path/to/frag2": [...]},
+            ...     group_ids={"/path/to/frag1": [...], "/path/to/frag2": [...]},
+            ...     group_order=["groupA", "groupB"]
+            ... )
+            >>> precalculate_insertion_counts(
+            ...     fragments=["/path/to/frag1", "/path/to/frag2"],
+            ...     cell_groups=cell_groups,
+            ...     ...
+            ... )
         chrom_sizes (str | dict[str, int]): Path/URL of UCSC-style chrom.sizes file, or dictionary mapping chromosome names to sizes
         threads (int): Number of threads to use during matrix calculation (default = 1)
         group_names (list[str], optional): Names for each group in the same order as group indices (0, 1, 2, ...).
@@ -345,11 +489,30 @@ def precalculate_insertion_counts(fragments: Union[str, List[str]], output_dir: 
         A :class:`PrecalculatedInsertionMatrix` object
 
     See Also:
+        :func:`build_cell_groups` : Create cell_groups categorical from fragments
         :class:`PrecalculatedInsertionMatrix`
     """
     # Convert single path to list for uniform handling
     if isinstance(fragments, str):
         fragments = [fragments]
+    
+    # Normalize fragment paths to absolute paths for consistency
+    fragments_normalized = [os.path.abspath(os.path.expanduser(f)) for f in fragments]
+    
+    # Validate that cell_groups length matches total cells across fragments
+    # This helps catch errors early if cell_groups was created incorrectly
+    total_cells = sum(len(bpcells.cpp.cell_names_fragments_dir(f)) for f in fragments_normalized)
+    if len(cell_groups) != total_cells:
+        if len(fragments_normalized) > 1:
+            raise ValueError(
+                f"cell_groups length ({len(cell_groups)}) does not match total cells across fragments ({total_cells}). "
+                f"When using multiple fragments, ensure cell_groups was created using build_cell_groups() "
+                f"with the dict-based API (cell_ids and group_ids as dicts)."
+            )
+        else:
+            raise ValueError(
+                f"cell_groups length ({len(cell_groups)}) does not match number of cells in fragment ({total_cells})."
+            )
 
     # Handle pd.Categorical input
     if isinstance(cell_groups, pd.Categorical):
@@ -367,13 +530,13 @@ def precalculate_insertion_counts(fragments: Union[str, List[str]], output_dir: 
         chrom_sizes = {t.chrom: t.size for t in chrom_sizes.itertuples()}
 
     # Re-order chrom_sizes to match the fragment file chromosome order (use first file as reference)
-    chrom_order = bpcells.cpp.chr_names_fragments_dir(fragments[0])
+    chrom_order = bpcells.cpp.chr_names_fragments_dir(fragments_normalized[0])
     chrom_sizes = dict(i for i in chrom_sizes.items() if i[0] in chrom_order)
     chrom_sizes = dict(sorted(chrom_sizes.items(), key = lambda x: chrom_order.index(x[0])))
 
     tmp = tempfile.TemporaryDirectory()
     bpcells.cpp.precalculate_pseudobulk_coverage(
-        fragments,
+        fragments_normalized,
         output_dir,
         tmp.name,
         list(chrom_sizes.keys()),
