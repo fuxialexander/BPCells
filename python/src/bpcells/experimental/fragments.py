@@ -278,8 +278,12 @@ def build_cell_groups(
         for group_id in cell_groups:
             if group_id is None:
                 remapped_cell_groups.append(None)
-            else:
+            elif group_id in group_id_to_new_index:
                 remapped_cell_groups.append(group_id_to_new_index[group_id])
+            else:
+                # This shouldn't happen, but handle it gracefully
+                # If group_id is not in included_group_ids, it means it was filtered out
+                remapped_cell_groups.append(None)
         # Use filtered_group_order as the new categories
         new_group_order = filtered_group_order
     else:
