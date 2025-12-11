@@ -625,6 +625,41 @@ def precalculate_insertion_counts(fragments: Union[str, List[str]], output_dir: 
         group_names
     )
 
+    # Filter library_size.json if we had filtered cells
+    # The C++ code may write library sizes for all groups, but we only want filtered ones
+    if isinstance(cell_groups, pd.Categorical) and hasattr(cell_groups, 'filtered_cell_indices'):
+        library_size_path = os.path.join(output_dir, "library_size.json")
+        if os.path.exists(library_size_path):
+            try:
+                with open(library_size_path, "r") as f:
+                    data = json.load(f)
+                    if isinstance(data, dict) and "library_sizes" in data:
+                        all_library_sizes = data["library_sizes"]
+                        # Get the unique group IDs from filtered cells (these are the codes)
+                        # For single_sparse, each cell is its own group, so codes are 0, 1, 2, ...
+                        # For celltype_dense, codes map to celltype indices
+                        unique_group_ids = sorted(set(cell_groups.codes))
+                        # Filter library sizes to only include groups that exist in filtered cells
+                        # The C++ code writes library sizes indexed by group_id, so we need to extract
+                        # only the library sizes for groups that exist in our filtered cell_groups
+                        filtered_library_sizes = []
+                        for group_id in unique_group_ids:
+                            if group_id >= 0 and group_id < len(all_library_sizes):
+                                filtered_library_sizes.append(all_library_sizes[group_id])
+                        
+                        # Only rewrite if we filtered out some library sizes
+                        if len(filtered_library_sizes) < len(all_library_sizes):
+                            data["library_sizes"] = filtered_library_sizes
+                            with open(library_size_path, "w") as f:
+                                json.dump(data, f, indent=2)
+            except Exception as e:
+                import warnings
+                warnings.warn(
+                    f"Could not filter library sizes: {e}",
+                    UserWarning,
+                    stacklevel=2
+                )
+
     chrom_offsets = dict(zip(chrom_sizes.keys(), [0] + np.cumsum(list(chrom_sizes.values()))[:-1].tolist()))
     json.dump(chrom_offsets, open(f"{output_dir}/chrom_offsets.json", "w"), indent=2)
     return PrecalculatedInsertionMatrix(output_dir)
