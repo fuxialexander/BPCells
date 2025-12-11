@@ -41,7 +41,9 @@ def build_cell_groups(
     fragments: Union[str, List[str]], 
     cell_ids: Union[Sequence[str], Dict[str, Sequence[str]]], 
     group_ids: Union[Sequence[str], Dict[str, Sequence[str]]], 
-    group_order: Sequence[str]
+    group_order: Sequence[str],
+    min_library_size: int = 1000,
+    max_library_size: int = 50000
 ) -> pd.Categorical:
     """Build cell_groups categorical for use in :func:`pseudobulk_insertion_counts()`
 
@@ -60,6 +62,12 @@ def build_cell_groups(
               Keys must match paths in ``fragments``. Each value must have same length as
               corresponding ``cell_ids[path]``. **Required for multiple fragments.**
         group_order (list[str]): Output order of pseudobulks (must contain all unique ``group_ids``)
+        min_library_size (int): Minimum library size (fragment count) to include a cell. 
+            Cells with library size < min_library_size will be excluded (set to NaN).
+            Default: 1000
+        max_library_size (int): Maximum library size (fragment count) to include a cell.
+            Cells with library size > max_library_size will be excluded (set to NaN).
+            Default: 50000
 
     Returns:
         pd.Categorical:
@@ -150,15 +158,35 @@ def build_cell_groups(
     # Build cell index lookup across all fragment files
     # Track cells in order across fragments to preserve fragment context for duplicate barcodes
     # Sequential matching is O(total_cells) which is optimal since we iterate through all cells anyway
-    cell_sequence = []  # List of (frag_path, cell_name, global_index) in order across all fragments
+    cell_sequence = []  # List of (frag_path, cell_name, global_index, frag_local_index) in order across all fragments
     current_index = 0
     for frag_path in fragments_normalized:
+        frag_local_index = 0
         for cell_name in bpcells.cpp.cell_names_fragments_dir(frag_path):
-            cell_sequence.append((frag_path, cell_name, current_index))
+            cell_sequence.append((frag_path, cell_name, current_index, frag_local_index))
             current_index += 1
+            frag_local_index += 1
 
     # Total number of cells across all fragments
     total_cells = current_index
+
+    # Load library sizes from each fragment directory
+    frag_library_sizes = {}  # Map from frag_path to array of library sizes
+    for frag_path in fragments_normalized:
+        library_size_path = os.path.join(frag_path, "library_size.json")
+        if os.path.exists(library_size_path):
+            try:
+                with open(library_size_path, 'r') as f:
+                    data = json.load(f)
+                    if isinstance(data, dict) and "library_sizes" in data:
+                        frag_library_sizes[frag_path] = np.array(data["library_sizes"], dtype=np.uint64)
+            except (json.JSONDecodeError, KeyError, ValueError) as e:
+                warnings.warn(
+                    f"Could not load library sizes from {library_size_path}: {e}. "
+                    f"Library size filtering will be skipped for this fragment.",
+                    UserWarning,
+                    stacklevel=2
+                )
 
     # Create array of group assignments
     cell_groups = [None] * total_cells
@@ -180,10 +208,22 @@ def build_cell_groups(
                 raise ValueError(f"group_ids contains groups not in group_order: {missing}")
         
         # Match cells using fragment-specific lookup
-        for frag_path, cell_name, global_idx in cell_sequence:
+        for frag_path, cell_name, global_idx, frag_local_idx in cell_sequence:
             if frag_path in frag_cell_maps and cell_name in frag_cell_maps[frag_path]:
-                # Match found - assign the corresponding group_id
-                cell_groups[global_idx] = frag_cell_maps[frag_path][cell_name]
+                # Match found - check library size filter if available
+                group_id = frag_cell_maps[frag_path][cell_name]
+                
+                # Apply library size filter if library sizes are available
+                if frag_path in frag_library_sizes:
+                    if frag_local_idx < len(frag_library_sizes[frag_path]):
+                        lib_size = frag_library_sizes[frag_path][frag_local_idx]
+                        if lib_size < min_library_size or lib_size > max_library_size:
+                            # Library size outside range - exclude this cell
+                            cell_groups[global_idx] = None
+                            continue
+                
+                # Assign the corresponding group_id
+                cell_groups[global_idx] = group_id
             # If no match, cell_groups[global_idx] remains None (cell excluded)
     else:
         # List-based API: name-based lookup (backward compatible)
@@ -201,10 +241,22 @@ def build_cell_groups(
         cell_to_group = dict(zip(cell_ids, group_ids))
         
         # Match cells using name-based lookup
-        for frag_path, cell_name, global_idx in cell_sequence:
+        for frag_path, cell_name, global_idx, frag_local_idx in cell_sequence:
             if cell_name in cell_to_group:
-                # Match found - assign the corresponding group_id
-                cell_groups[global_idx] = cell_to_group[cell_name]
+                # Match found - check library size filter if available
+                group_id = cell_to_group[cell_name]
+                
+                # Apply library size filter if library sizes are available
+                if frag_path in frag_library_sizes:
+                    if frag_local_idx < len(frag_library_sizes[frag_path]):
+                        lib_size = frag_library_sizes[frag_path][frag_local_idx]
+                        if lib_size < min_library_size or lib_size > max_library_size:
+                            # Library size outside range - exclude this cell
+                            cell_groups[global_idx] = None
+                            continue
+                
+                # Assign the corresponding group_id
+                cell_groups[global_idx] = group_id
             # If no match, cell_groups[global_idx] remains None (cell excluded)
 
     # Create categorical with ordered categories
