@@ -191,6 +191,7 @@ def build_cell_groups(
     # Create array of group assignments - full length with None/NaN for excluded cells
     # This matches the documented behavior: excluded cells are set to NaN
     cell_groups = [None] * total_cells
+    included_group_ids = []  # Track which group_ids are actually included (after filtering)
 
     if using_dict_api:
         # Dict-based API: match cells per fragment
@@ -225,6 +226,8 @@ def build_cell_groups(
                 
                 # Assign the corresponding group_id
                 cell_groups[global_idx] = group_id
+                if group_id not in included_group_ids:
+                    included_group_ids.append(group_id)
             # If no match, cell_groups[global_idx] remains None (cell excluded)
     else:
         # List-based API: name-based lookup (backward compatible)
@@ -258,11 +261,35 @@ def build_cell_groups(
                 
                 # Assign the corresponding group_id
                 cell_groups[global_idx] = group_id
+                if group_id not in included_group_ids:
+                    included_group_ids.append(group_id)
             # If no match, cell_groups[global_idx] remains None (cell excluded)
 
+    # Regenerate group_order to only include groups that have included cells
+    # This ensures categorical codes are 0 to N-1 (where N = number of included groups)
+    # rather than scattered indices into the full group_order
+    if included_group_ids:
+        # Sort to maintain order, but only include groups that have included cells
+        filtered_group_order = sorted(set(included_group_ids))
+        # Create a mapping from old group_id to new index
+        group_id_to_new_index = {old_id: new_idx for new_idx, old_id in enumerate(filtered_group_order)}
+        # Remap cell_groups to use new indices
+        remapped_cell_groups = []
+        for group_id in cell_groups:
+            if group_id is None:
+                remapped_cell_groups.append(None)
+            else:
+                remapped_cell_groups.append(group_id_to_new_index[group_id])
+        # Use filtered_group_order as the new categories
+        new_group_order = filtered_group_order
+    else:
+        # No included cells - use empty group_order
+        remapped_cell_groups = cell_groups
+        new_group_order = []
+
     # Create categorical with ordered categories - full length with NaN for excluded cells
-    # This matches the documented behavior where excluded cells are set to NaN
-    return pd.Categorical(cell_groups, categories=group_order, ordered=True)
+    # Using filtered group_order so codes are 0 to N-1 instead of scattered indices
+    return pd.Categorical(remapped_cell_groups, categories=new_group_order, ordered=True)
 
 def pseudobulk_insertion_counts(fragments: str, regions: pd.DataFrame, cell_groups: Union[Sequence[int], pd.Categorical], bin_size: int = 1) -> np.ndarray:
     """Calculate a pseudobulk coverage matrix
