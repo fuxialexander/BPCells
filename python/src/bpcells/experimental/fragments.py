@@ -188,10 +188,9 @@ def build_cell_groups(
                     stacklevel=2
                 )
 
-    # Create array of group assignments - only include cells that pass filters
-    # Track which cells are included (filtered_cell_indices) and their group assignments
-    filtered_cell_groups = []
-    filtered_cell_indices = []  # Maps filtered index -> global cell index in fragments
+    # Create array of group assignments - full length with None/NaN for excluded cells
+    # This matches the documented behavior: excluded cells are set to NaN
+    cell_groups = [None] * total_cells
 
     if using_dict_api:
         # Dict-based API: match cells per fragment
@@ -220,12 +219,13 @@ def build_cell_groups(
                     if frag_local_idx < len(frag_library_sizes[frag_path]):
                         lib_size = frag_library_sizes[frag_path][frag_local_idx]
                         if lib_size < min_library_size or lib_size > max_library_size:
-                            # Library size outside range - skip this cell entirely
+                            # Library size outside range - exclude this cell (set to None/NaN)
+                            cell_groups[global_idx] = None
                             continue
                 
-                # Cell passes filter - include it
-                filtered_cell_groups.append(group_id)
-                filtered_cell_indices.append(global_idx)
+                # Assign the corresponding group_id
+                cell_groups[global_idx] = group_id
+            # If no match, cell_groups[global_idx] remains None (cell excluded)
     else:
         # List-based API: name-based lookup (backward compatible)
         # Validate that all group_ids are in group_order
@@ -252,18 +252,17 @@ def build_cell_groups(
                     if frag_local_idx < len(frag_library_sizes[frag_path]):
                         lib_size = frag_library_sizes[frag_path][frag_local_idx]
                         if lib_size < min_library_size or lib_size > max_library_size:
-                            # Library size outside range - skip this cell entirely
+                            # Library size outside range - exclude this cell (set to None/NaN)
+                            cell_groups[global_idx] = None
                             continue
                 
-                # Cell passes filter - include it
-                filtered_cell_groups.append(group_id)
-                filtered_cell_indices.append(global_idx)
+                # Assign the corresponding group_id
+                cell_groups[global_idx] = group_id
+            # If no match, cell_groups[global_idx] remains None (cell excluded)
 
-    # Create categorical with ordered categories - only includes filtered cells
-    # Store filtered_cell_indices as an attribute for use in precalculate_insertion_counts
-    cat = pd.Categorical(filtered_cell_groups, categories=group_order, ordered=True)
-    cat.filtered_cell_indices = np.array(filtered_cell_indices, dtype=np.int32)
-    return cat
+    # Create categorical with ordered categories - full length with NaN for excluded cells
+    # This matches the documented behavior where excluded cells are set to NaN
+    return pd.Categorical(cell_groups, categories=group_order, ordered=True)
 
 def pseudobulk_insertion_counts(fragments: str, regions: pd.DataFrame, cell_groups: Union[Sequence[int], pd.Categorical], bin_size: int = 1) -> np.ndarray:
     """Calculate a pseudobulk coverage matrix
@@ -565,14 +564,9 @@ def precalculate_insertion_counts(fragments: Union[str, List[str]], output_dir: 
         if group_names is None:
             group_names = list(cell_groups.categories)
         
-        # Check if this is a filtered categorical (has filtered_cell_indices attribute)
-        if hasattr(cell_groups, 'filtered_cell_indices'):
-            # Filtered version: create full array with -1 for excluded cells
-            filtered_indices = cell_groups.filtered_cell_indices
-            cell_groups_array = np.full(total_cells, -1, dtype=np.int32)
-            # Map filtered cells to their group codes
-            cell_groups_array[filtered_indices] = cell_groups.codes.astype(np.int32)
-        else:
+        # Handle pd.Categorical input - convert NaN to -1 for C++ function
+        # According to documentation, excluded cells should be set to NaN in the categorical
+        # The C++ function should skip cells with -1 (NaN codes)
             # Full version: all cells included
             if len(cell_groups) != total_cells:
                 if len(fragments_normalized) > 1:
