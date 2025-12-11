@@ -649,7 +649,8 @@ void precalculate_pseudobulk_coverage(
             }
 
             // Process the futures (we'll ignore the results since we have precalculated library sizes)
-            parallel_map_helper(task_vec, threads, nullptr);
+            // Omit the third parameter to use default nullptr, allowing template type deduction
+            parallel_map_helper(task_vec, threads);
         });
     }
 
