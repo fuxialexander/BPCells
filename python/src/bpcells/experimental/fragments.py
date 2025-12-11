@@ -188,10 +188,10 @@ def build_cell_groups(
                     stacklevel=2
                 )
 
-    # Create array of group assignments - full length with None/NaN for excluded cells
-    # This matches the documented behavior: excluded cells are set to NaN
-    cell_groups = [None] * total_cells
-    included_group_ids = []  # Track which group_ids are actually included (after filtering)
+    # Create array of group assignments - only include cells that pass filters
+    # Track which cells are included (filtered_cell_indices) and their group assignments
+    filtered_cell_groups = []
+    filtered_cell_indices = []  # Maps filtered index -> global cell index in fragments
 
     if using_dict_api:
         # Dict-based API: match cells per fragment
@@ -220,15 +220,12 @@ def build_cell_groups(
                     if frag_local_idx < len(frag_library_sizes[frag_path]):
                         lib_size = frag_library_sizes[frag_path][frag_local_idx]
                         if lib_size < min_library_size or lib_size > max_library_size:
-                            # Library size outside range - exclude this cell (set to None/NaN)
-                            cell_groups[global_idx] = None
+                            # Library size outside range - skip this cell entirely
                             continue
                 
-                # Assign the corresponding group_id
-                cell_groups[global_idx] = group_id
-                if group_id not in included_group_ids:
-                    included_group_ids.append(group_id)
-            # If no match, cell_groups[global_idx] remains None (cell excluded)
+                # Cell passes filter - include it
+                filtered_cell_groups.append(group_id)
+                filtered_cell_indices.append(global_idx)
     else:
         # List-based API: name-based lookup (backward compatible)
         # Validate that all group_ids are in group_order
@@ -255,48 +252,18 @@ def build_cell_groups(
                     if frag_local_idx < len(frag_library_sizes[frag_path]):
                         lib_size = frag_library_sizes[frag_path][frag_local_idx]
                         if lib_size < min_library_size or lib_size > max_library_size:
-                            # Library size outside range - exclude this cell (set to None/NaN)
-                            cell_groups[global_idx] = None
+                            # Library size outside range - skip this cell entirely
                             continue
                 
-                # Assign the corresponding group_id
-                cell_groups[global_idx] = group_id
-                if group_id not in included_group_ids:
-                    included_group_ids.append(group_id)
-            # If no match, cell_groups[global_idx] remains None (cell excluded)
+                # Cell passes filter - include it
+                filtered_cell_groups.append(group_id)
+                filtered_cell_indices.append(global_idx)
 
-    # Regenerate group_order to only include groups that have included cells
-    # This ensures categorical codes are 0 to N-1 (where N = number of included groups)
-    # rather than scattered indices into the full group_order
-    if included_group_ids:
-        # Sort to maintain order, but only include groups that have included cells
-        filtered_group_order = sorted(set(included_group_ids))
-        # Create a mapping from old group_id to the group name (for categorical)
-        # Note: group_id IS the group name in single_sparse mode, so we can use it directly
-        # But we need to remap to use filtered_group_order so codes are 0 to N-1
-        remapped_cell_groups = []
-        for group_id in cell_groups:
-            if group_id is None:
-                remapped_cell_groups.append(None)
-            elif group_id in filtered_group_order:
-                # Use the group_id directly (it's the group name)
-                # The categorical will assign codes 0 to N-1 based on filtered_group_order
-                remapped_cell_groups.append(group_id)
-            else:
-                # This shouldn't happen, but handle it gracefully
-                # If group_id is not in filtered_group_order, it means it was filtered out
-                remapped_cell_groups.append(None)
-        # Use filtered_group_order as the new categories
-        # This ensures codes are 0 to N-1 (where N = len(filtered_group_order))
-        new_group_order = filtered_group_order
-    else:
-        # No included cells - use empty group_order
-        remapped_cell_groups = cell_groups
-        new_group_order = []
-
-    # Create categorical with ordered categories - full length with NaN for excluded cells
-    # Using filtered group_order so codes are 0 to N-1 instead of scattered indices
-    return pd.Categorical(remapped_cell_groups, categories=new_group_order, ordered=True)
+    # Create categorical with ordered categories - only includes filtered cells
+    # Store filtered_cell_indices as an attribute for use in precalculate_insertion_counts
+    cat = pd.Categorical(filtered_cell_groups, categories=group_order, ordered=True)
+    cat.filtered_cell_indices = np.array(filtered_cell_indices, dtype=np.int32)
+    return cat
 
 def pseudobulk_insertion_counts(fragments: str, regions: pd.DataFrame, cell_groups: Union[Sequence[int], pd.Categorical], bin_size: int = 1) -> np.ndarray:
     """Calculate a pseudobulk coverage matrix
@@ -598,33 +565,29 @@ def precalculate_insertion_counts(fragments: Union[str, List[str]], output_dir: 
         if group_names is None:
             group_names = list(cell_groups.categories)
         
-        # Validate length - should match total cells (excluded cells are set to NaN)
-        if len(cell_groups) != total_cells:
-            if len(fragments_normalized) > 1:
-                raise ValueError(
-                    f"cell_groups length ({len(cell_groups)}) does not match total cells across fragments ({total_cells}). "
-                    f"When using multiple fragments, ensure cell_groups was created using build_cell_groups() "
-                    f"with the dict-based API (cell_ids and group_ids as dicts)."
-                )
-            else:
-                raise ValueError(
-                    f"cell_groups length ({len(cell_groups)}) does not match number of cells in fragment ({total_cells})."
-                )
-        
-        # Convert to integer array - NaN codes become -1, which the C++ function should skip
-        cell_groups_array = cell_groups.codes.astype(np.int32)
-        # Ensure NaN codes are -1 (they should already be, but make sure)
-        cell_groups_array[cell_groups_array == -1] = -1
-        
-        # Count excluded cells (those with -1)
-        n_excluded = (cell_groups_array == -1).sum()
-        n_included = total_cells - n_excluded
-        if n_excluded > 0:
-            import logging
-            logging.info(
-                f"Cell filtering: {n_included} cells included, {n_excluded} cells excluded. "
-                f"The C++ function should skip cells with -1 (excluded cells)."
-            )
+        # Check if this is a filtered categorical (has filtered_cell_indices attribute)
+        if hasattr(cell_groups, 'filtered_cell_indices'):
+            # Filtered version: create full array with -1 for excluded cells
+            filtered_indices = cell_groups.filtered_cell_indices
+            cell_groups_array = np.full(total_cells, -1, dtype=np.int32)
+            # Map filtered cells to their group codes
+            cell_groups_array[filtered_indices] = cell_groups.codes.astype(np.int32)
+        else:
+            # Full version: all cells included
+            if len(cell_groups) != total_cells:
+                if len(fragments_normalized) > 1:
+                    raise ValueError(
+                        f"cell_groups length ({len(cell_groups)}) does not match total cells across fragments ({total_cells}). "
+                        f"When using multiple fragments, ensure cell_groups was created using build_cell_groups() "
+                        f"with the dict-based API (cell_ids and group_ids as dicts)."
+                    )
+                else:
+                    raise ValueError(
+                        f"cell_groups length ({len(cell_groups)}) does not match number of cells in fragment ({total_cells})."
+                    )
+            # Convert to integer array
+            cell_groups_array = cell_groups.codes.astype(np.int32)
+            cell_groups_array[cell_groups_array == -1] = -1  # Ensure NaN becomes -1
     else:
         # Non-categorical input: validate length
         if len(cell_groups) != total_cells:
@@ -639,14 +602,6 @@ def precalculate_insertion_counts(fragments: Union[str, List[str]], output_dir: 
                     f"cell_groups length ({len(cell_groups)}) does not match number of cells in fragment ({total_cells})."
                 )
         cell_groups_array = cell_groups
-    
-    # Ensure cell_groups_array is defined (safety check)
-    if 'cell_groups_array' not in locals():
-        raise RuntimeError(
-            f"cell_groups_array was not assigned. This should not happen. "
-            f"cell_groups type: {type(cell_groups)}, "
-            f"isinstance(cell_groups, pd.Categorical): {isinstance(cell_groups, pd.Categorical)}"
-        )
 
     if isinstance(chrom_sizes, str):
         chrom_sizes = pd.read_csv(chrom_sizes, sep="\t", names=["chrom", "size"])
