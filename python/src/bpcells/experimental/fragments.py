@@ -598,24 +598,33 @@ def precalculate_insertion_counts(fragments: Union[str, List[str]], output_dir: 
         if group_names is None:
             group_names = list(cell_groups.categories)
         
-        # Handle pd.Categorical input - convert NaN to -1 for C++ function
-        # According to documentation, excluded cells should be set to NaN in the categorical
-        # The C++ function should skip cells with -1 (NaN codes)
-            # Full version: all cells included
-            if len(cell_groups) != total_cells:
-                if len(fragments_normalized) > 1:
-                    raise ValueError(
-                        f"cell_groups length ({len(cell_groups)}) does not match total cells across fragments ({total_cells}). "
-                        f"When using multiple fragments, ensure cell_groups was created using build_cell_groups() "
-                        f"with the dict-based API (cell_ids and group_ids as dicts)."
-                    )
-                else:
-                    raise ValueError(
-                        f"cell_groups length ({len(cell_groups)}) does not match number of cells in fragment ({total_cells})."
-                    )
-            # Convert to integer array
-            cell_groups_array = cell_groups.codes.astype(np.int32)
-            cell_groups_array[cell_groups_array == -1] = -1  # Ensure NaN becomes -1
+        # Validate length - should match total cells (excluded cells are set to NaN)
+        if len(cell_groups) != total_cells:
+            if len(fragments_normalized) > 1:
+                raise ValueError(
+                    f"cell_groups length ({len(cell_groups)}) does not match total cells across fragments ({total_cells}). "
+                    f"When using multiple fragments, ensure cell_groups was created using build_cell_groups() "
+                    f"with the dict-based API (cell_ids and group_ids as dicts)."
+                )
+            else:
+                raise ValueError(
+                    f"cell_groups length ({len(cell_groups)}) does not match number of cells in fragment ({total_cells})."
+                )
+        
+        # Convert to integer array - NaN codes become -1, which the C++ function should skip
+        cell_groups_array = cell_groups.codes.astype(np.int32)
+        # Ensure NaN codes are -1 (they should already be, but make sure)
+        cell_groups_array[cell_groups_array == -1] = -1
+        
+        # Count excluded cells (those with -1)
+        n_excluded = (cell_groups_array == -1).sum()
+        n_included = total_cells - n_excluded
+        if n_excluded > 0:
+            import logging
+            logging.info(
+                f"Cell filtering: {n_included} cells included, {n_excluded} cells excluded. "
+                f"The C++ function should skip cells with -1 (excluded cells)."
+            )
     else:
         # Non-categorical input: validate length
         if len(cell_groups) != total_cells:
@@ -630,6 +639,14 @@ def precalculate_insertion_counts(fragments: Union[str, List[str]], output_dir: 
                     f"cell_groups length ({len(cell_groups)}) does not match number of cells in fragment ({total_cells})."
                 )
         cell_groups_array = cell_groups
+    
+    # Ensure cell_groups_array is defined (safety check)
+    if 'cell_groups_array' not in locals():
+        raise RuntimeError(
+            f"cell_groups_array was not assigned. This should not happen. "
+            f"cell_groups type: {type(cell_groups)}, "
+            f"isinstance(cell_groups, pd.Categorical): {isinstance(cell_groups, pd.Categorical)}"
+        )
 
     if isinstance(chrom_sizes, str):
         chrom_sizes = pd.read_csv(chrom_sizes, sep="\t", names=["chrom", "size"])
