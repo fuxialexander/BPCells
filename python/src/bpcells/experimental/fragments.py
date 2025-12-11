@@ -1,4 +1,4 @@
-# Copyright 2023 BPCells contributors
+jup# Copyright 2023 BPCells contributors
 # 
 # Licensed under the Apache License, Version 2.0 <LICENSE-APACHE or
 # https://www.apache.org/licenses/LICENSE-2.0> or the MIT license
@@ -271,20 +271,23 @@ def build_cell_groups(
     if included_group_ids:
         # Sort to maintain order, but only include groups that have included cells
         filtered_group_order = sorted(set(included_group_ids))
-        # Create a mapping from old group_id to new index
-        group_id_to_new_index = {old_id: new_idx for new_idx, old_id in enumerate(filtered_group_order)}
-        # Remap cell_groups to use new indices
+        # Create a mapping from old group_id to the group name (for categorical)
+        # Note: group_id IS the group name in single_sparse mode, so we can use it directly
+        # But we need to remap to use filtered_group_order so codes are 0 to N-1
         remapped_cell_groups = []
         for group_id in cell_groups:
             if group_id is None:
                 remapped_cell_groups.append(None)
-            elif group_id in group_id_to_new_index:
-                remapped_cell_groups.append(group_id_to_new_index[group_id])
+            elif group_id in filtered_group_order:
+                # Use the group_id directly (it's the group name)
+                # The categorical will assign codes 0 to N-1 based on filtered_group_order
+                remapped_cell_groups.append(group_id)
             else:
                 # This shouldn't happen, but handle it gracefully
-                # If group_id is not in included_group_ids, it means it was filtered out
+                # If group_id is not in filtered_group_order, it means it was filtered out
                 remapped_cell_groups.append(None)
         # Use filtered_group_order as the new categories
+        # This ensures codes are 0 to N-1 (where N = len(filtered_group_order))
         new_group_order = filtered_group_order
     else:
         # No included cells - use empty group_order
