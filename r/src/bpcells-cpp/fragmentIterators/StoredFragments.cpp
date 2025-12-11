@@ -8,9 +8,12 @@
 
 #include <atomic>
 #include <algorithm>
+#include <fstream>
+#include <cmath>
 
 #include "StoredFragments.h"
 #include "../simd/math.h"
+#include "../utils/filesystem_compat.h"
 
 namespace BPCells {
 
@@ -291,7 +294,8 @@ StoredFragmentsWriter::StoredFragmentsWriter(
     ULongWriter &&chr_ptr,
     std::unique_ptr<StringWriter> &&chr_names,
     std::unique_ptr<StringWriter> &&cell_names,
-    bool subtract_start_from_end
+    bool subtract_start_from_end,
+    std::string output_path
 )
     : cell(std::move(cell))
     , start(std::move(start))
@@ -300,9 +304,10 @@ StoredFragmentsWriter::StoredFragmentsWriter(
     , chr_ptr(std::move(chr_ptr))
     , chr_names(std::move(chr_names))
     , cell_names(std::move(cell_names))
-    , subtract_start_from_end(subtract_start_from_end) {}
+    , subtract_start_from_end(subtract_start_from_end)
+    , output_path(std::move(output_path)) {}
 
-StoredFragmentsWriter StoredFragmentsWriter::createUnpacked(WriterBuilder &wb) {
+StoredFragmentsWriter StoredFragmentsWriter::createUnpacked(WriterBuilder &wb, std::string output_path) {
     wb.writeVersion("unpacked-fragments-v2");
     return StoredFragmentsWriter(
         wb.createUIntWriter("cell"),
@@ -312,11 +317,12 @@ StoredFragmentsWriter StoredFragmentsWriter::createUnpacked(WriterBuilder &wb) {
         wb.createULongWriter("chr_ptr"),
         wb.createStringWriter("chr_names"),
         wb.createStringWriter("cell_names"),
-        false
+        false,
+        std::move(output_path)
     );
 }
 
-StoredFragmentsWriter StoredFragmentsWriter::createPacked(WriterBuilder &wb, uint32_t buffer_size) {
+StoredFragmentsWriter StoredFragmentsWriter::createPacked(WriterBuilder &wb, uint32_t buffer_size, std::string output_path) {
     wb.writeVersion("packed-fragments-v2");
 
     return StoredFragmentsWriter(
@@ -349,7 +355,8 @@ StoredFragmentsWriter StoredFragmentsWriter::createPacked(WriterBuilder &wb, uin
         wb.createULongWriter("chr_ptr"),
         wb.createStringWriter("chr_names"),
         wb.createStringWriter("cell_names"),
-        true
+        true,
+        std::move(output_path)
     );
 }
 
@@ -359,6 +366,11 @@ void StoredFragmentsWriter::write(FragmentLoader &fragments, std::atomic<bool> *
     uint64_t idx = 0;
 
     std::vector<uint64_t> chr_ptr_buf;
+
+    // Library size tracking with dynamic resizing: start with 10k, then 50k, 250k, etc. (5x increments)
+    uint64_t library_size_capacity = 10000;
+    std::vector<uint64_t> cell_library_sizes(library_size_capacity, 0);
+    uint32_t max_cell_id_seen = 0;
 
     uint64_t write_capacity =
         std::min({cell.maxCapacity(), start.maxCapacity(), end.maxCapacity()});
@@ -382,6 +394,25 @@ void StoredFragmentsWriter::write(FragmentLoader &fragments, std::atomic<bool> *
             const uint32_t *in_cell_data = fragments.cellData();
             const uint32_t *in_start_data = fragments.startData();
             uint32_t *in_end_data = fragments.endData();
+
+            // Track library sizes for each cell
+            for (uint64_t j = 0; j < capacity; j++) {
+                uint32_t cell_id = in_cell_data[j];
+                // Track maximum cell_id seen
+                if (cell_id > max_cell_id_seen) {
+                    max_cell_id_seen = cell_id;
+                }
+                // Dynamically resize if needed (5x increments: 10k -> 50k -> 250k -> ...)
+                if (cell_id >= library_size_capacity) {
+                    uint64_t new_capacity = library_size_capacity;
+                    while (cell_id >= new_capacity) {
+                        new_capacity *= 5;
+                    }
+                    cell_library_sizes.resize(new_capacity, 0);
+                    library_size_capacity = new_capacity;
+                }
+                cell_library_sizes[cell_id]++;
+            }
 
             uint64_t i = 0;
 
@@ -472,6 +503,43 @@ void StoredFragmentsWriter::write(FragmentLoader &fragments, std::atomic<bool> *
         chr_names.push_back(std::string(chr_name));
     }
     this->chr_names->write(VecStringReader(chr_names));
+
+    // Write library sizes to JSON file if output_path is provided
+    if (!output_path.empty()) {
+        // Determine the actual number of cells (max_cell_id_seen + 1, but also check cell_names size)
+        // Use the larger of the two to ensure we capture all cells
+        uint64_t actual_cell_count = std::max((uint64_t)(max_cell_id_seen + 1), (uint64_t)cell_names.size());
+        // Trim the library_sizes vector to actual cell count
+        if (actual_cell_count < cell_library_sizes.size()) {
+            cell_library_sizes.resize(actual_cell_count);
+        }
+
+        // Ensure the output directory exists
+        std_fs::path output_dir(output_path);
+        if (!std_fs::exists(output_dir)) {
+            std_fs::create_directories(output_dir);
+        }
+
+        // Write library sizes to JSON format
+        std::string library_size_path = (std_fs::path(output_path) / "library_size.json").string();
+        std::ofstream out_file(library_size_path);
+        if (!out_file) {
+            throw std::runtime_error("Could not open file for writing library sizes: " + library_size_path);
+        }
+
+        out_file << "{\n";
+        out_file << "  \"library_sizes\": [\n";
+        for (size_t i = 0; i < cell_library_sizes.size(); i++) {
+            out_file << "    " << cell_library_sizes[i];
+            if (i < cell_library_sizes.size() - 1) {
+                out_file << ",";
+            }
+            out_file << "\n";
+        }
+        out_file << "  ]\n";
+        out_file << "}\n";
+        out_file.close();
+    }
 }
 
 } // end namespace BPCells

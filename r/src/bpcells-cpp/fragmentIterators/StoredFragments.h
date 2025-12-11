@@ -108,11 +108,12 @@ class StoredFragmentsWriter : public FragmentWriter {
     std::unique_ptr<StringWriter> chr_names, cell_names;
 
     bool subtract_start_from_end; // Set to true if writing packed
+    std::string output_path; // Optional path for writing library sizes
     void subStartEnd();
 
   public:
-    static StoredFragmentsWriter createUnpacked(WriterBuilder &wb);
-    static StoredFragmentsWriter createPacked(WriterBuilder &wb, uint32_t buffer_size = 1024);
+    static StoredFragmentsWriter createUnpacked(WriterBuilder &wb, std::string output_path = "");
+    static StoredFragmentsWriter createPacked(WriterBuilder &wb, uint32_t buffer_size = 1024, std::string output_path = "");
     StoredFragmentsWriter(
         UIntWriter &&cell,
         UIntWriter &&start,
@@ -121,7 +122,8 @@ class StoredFragmentsWriter : public FragmentWriter {
         ULongWriter &&chr_ptr,
         std::unique_ptr<StringWriter> &&chr_names,
         std::unique_ptr<StringWriter> &&cell_names,
-        bool subtract_start_from_end
+        bool subtract_start_from_end,
+        std::string output_path = ""
     );
 
     void write(FragmentLoader &fragments, std::atomic<bool> *user_interrupt = NULL) override;

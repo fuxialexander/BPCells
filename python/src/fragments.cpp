@@ -7,6 +7,9 @@
 // except according to those terms.
 
 #include <vector>
+#include <fstream>
+#include <sstream>
+#include <string>
 
 #include "fragments.hpp"
 #include "py_interrupts.hpp"
@@ -46,7 +49,7 @@ void import_10x_fragments(
     }
 
     run_with_py_interrupt_check(
-        &StoredFragmentsWriter::write, StoredFragmentsWriter::createPacked(wb), std::ref(*frags)
+        &StoredFragmentsWriter::write, StoredFragmentsWriter::createPacked(wb, 1024, output_bpcells), std::ref(*frags)
     );
 }
 
@@ -212,6 +215,87 @@ void parallel_map_helper(std::vector<std::future<T>> &futures, size_t threads, s
     if (has_error) {
         std::rethrow_exception(exception);
     }
+}
+
+// Helper function to read library_size.json from a fragments directory
+// Returns empty vector if file doesn't exist or can't be parsed
+static std::vector<uint64_t> read_library_sizes_from_json(const std::string &fragments_path) {
+    std::string library_size_path = (std_fs::path(fragments_path) / "library_size.json").string();
+    
+    if (!std_fs::exists(std_fs::path(library_size_path))) {
+        return std::vector<uint64_t>();
+    }
+    
+    std::ifstream in_file(library_size_path);
+    if (!in_file) {
+        return std::vector<uint64_t>();
+    }
+    
+    // Simple JSON parser for the specific format: {"library_sizes": [1, 2, 3, ...]}
+    std::string line;
+    std::string content;
+    while (std::getline(in_file, line)) {
+        content += line;
+    }
+    
+    // Find the library_sizes array
+    size_t start_pos = content.find("\"library_sizes\"");
+    if (start_pos == std::string::npos) {
+        return std::vector<uint64_t>();
+    }
+    
+    // Find the opening bracket
+    size_t bracket_start = content.find('[', start_pos);
+    if (bracket_start == std::string::npos) {
+        return std::vector<uint64_t>();
+    }
+    
+    // Find the closing bracket
+    size_t bracket_end = content.find(']', bracket_start);
+    if (bracket_end == std::string::npos) {
+        return std::vector<uint64_t>();
+    }
+    
+    // Extract the array content
+    std::string array_content = content.substr(bracket_start + 1, bracket_end - bracket_start - 1);
+    
+    // Parse numbers
+    std::vector<uint64_t> library_sizes;
+    std::istringstream iss(array_content);
+    std::string token;
+    
+    while (std::getline(iss, token, ',')) {
+        // Trim whitespace from start
+        size_t start = token.find_first_not_of(" \t\n\r");
+        if (start != std::string::npos) {
+            token.erase(0, start);
+        } else {
+            // Token is all whitespace
+            token.clear();
+        }
+        
+        // Trim whitespace from end
+        if (!token.empty()) {
+            size_t end = token.find_last_not_of(" \t\n\r");
+            if (end != std::string::npos) {
+                token.erase(end + 1);
+            } else {
+                // Token is all whitespace (shouldn't happen after start trim, but be safe)
+                token.clear();
+            }
+        }
+        
+        if (!token.empty()) {
+            try {
+                library_sizes.push_back(std::stoull(token));
+            } catch (...) {
+                // Skip invalid numbers
+                continue;
+            }
+        }
+    }
+    
+    return library_sizes;
 }
 
 // Write a chunk of the tile matrix columns to the given output path
@@ -424,61 +508,150 @@ void precalculate_pseudobulk_coverage(
         chunk_output_paths.push_back((std_fs::path(tmp_path) / std::to_string(i)).string());
     }
 
-    // Vector to store group sums from all chunks
-    std::vector<std::vector<uint64_t>> all_group_sums;
-
-    // Make all the matrix chunks
-    run_with_py_interrupt_check([&fragments_paths,
-                                        &chunk_output_paths,
-                                        &chunk_col_splits,
-                                        &cell_groups_uint,
-                                        &actual_group_names,
-                                        &chr_id,
-                                        &start,
-                                        &chr_len,
-                                        &tile_width,
-                                        &chr_levels,
-                                        &all_group_sums,
-                                        threads,
-                                        chunks](std::atomic<bool> *user_interrupt) {
-        std::vector<std::future<std::vector<uint64_t>>> task_vec;
-        all_group_sums.resize(chunks);
-
-        for (size_t i = 0; i < chunks; i++) {
-            task_vec.push_back(std::async(
-                std::launch::deferred,
-                &precalculate_pseudobulk_coverage_helper,
-                std::cref(fragments_paths),
-                chunk_output_paths[i],
-                chunk_col_splits[i],
-
-                std::cref(cell_groups_uint),
-                std::cref(actual_group_names),
-
-                std::cref(chr_id),
-                std::cref(start),
-                std::cref(chr_len),
-                std::cref(tile_width),
-                std::cref(chr_levels),
-
-                user_interrupt
-            ));
+    // Check if library_size.json exists in any fragments directory
+    // If it does, load per-cell library sizes and aggregate by cell_groups
+    std::vector<uint64_t> final_group_sums;
+    bool use_precalculated_library_sizes = false;
+    
+    // Try to load library sizes from fragments
+    std::vector<uint64_t> all_cell_library_sizes;
+    bool all_fragments_have_library_sizes = true;
+    
+    for (const auto &frag_path : fragments_paths) {
+        std::vector<uint64_t> frag_library_sizes = read_library_sizes_from_json(frag_path);
+        if (frag_library_sizes.empty()) {
+            all_fragments_have_library_sizes = false;
+            break;
         }
-
-        // Process the futures and collect the group sums in parallel
-        parallel_map_helper(task_vec, threads, &all_group_sums);
-    });
-
-    // Combine group sums from all chunks
-    std::vector<uint64_t> total_group_sums(num_groups + 1, 0);
-    for (const auto &chunk_sums : all_group_sums) {
-        for (size_t i = 0; i < chunk_sums.size() && i < total_group_sums.size(); i++) {
-            total_group_sums[i] += chunk_sums[i];
+        // Append library sizes from this fragment
+        all_cell_library_sizes.insert(all_cell_library_sizes.end(), 
+                                      frag_library_sizes.begin(), 
+                                      frag_library_sizes.end());
+    }
+    
+    // If we successfully loaded library sizes from all fragments, aggregate by cell_groups
+    if (all_fragments_have_library_sizes && !all_cell_library_sizes.empty()) {
+        // Verify that the number of cells matches
+        if (all_cell_library_sizes.size() == cell_groups.size()) {
+            // Aggregate library sizes by cell groups
+            final_group_sums.resize(num_groups, 0);
+            for (size_t i = 0; i < cell_groups.size(); i++) {
+                int32_t group_id = cell_groups[i];
+                if (group_id >= 0 && group_id < (int32_t)num_groups) {
+                    final_group_sums[group_id] += all_cell_library_sizes[i];
+                }
+            }
+            use_precalculated_library_sizes = true;
         }
     }
     
-    // Only keep the actual groups (exclude the last "discard" group) - save for later use
-    std::vector<uint64_t> final_group_sums(total_group_sums.begin(), total_group_sums.begin() + num_groups);
+    // If we didn't use precalculated library sizes, calculate from matrix
+    if (!use_precalculated_library_sizes) {
+        // Vector to store group sums from all chunks
+        std::vector<std::vector<uint64_t>> all_group_sums;
+
+        // Make all the matrix chunks
+        run_with_py_interrupt_check([&fragments_paths,
+                                            &chunk_output_paths,
+                                            &chunk_col_splits,
+                                            &cell_groups_uint,
+                                            &actual_group_names,
+                                            &chr_id,
+                                            &start,
+                                            &chr_len,
+                                            &tile_width,
+                                            &chr_levels,
+                                            &all_group_sums,
+                                            threads,
+                                            chunks](std::atomic<bool> *user_interrupt) {
+            std::vector<std::future<std::vector<uint64_t>>> task_vec;
+            all_group_sums.resize(chunks);
+
+            for (size_t i = 0; i < chunks; i++) {
+                task_vec.push_back(std::async(
+                    std::launch::deferred,
+                    &precalculate_pseudobulk_coverage_helper,
+                    std::cref(fragments_paths),
+                    chunk_output_paths[i],
+                    chunk_col_splits[i],
+
+                    std::cref(cell_groups_uint),
+                    std::cref(actual_group_names),
+
+                    std::cref(chr_id),
+                    std::cref(start),
+                    std::cref(chr_len),
+                    std::cref(tile_width),
+                    std::cref(chr_levels),
+
+                    user_interrupt
+                ));
+            }
+
+            // Process the futures and collect the group sums in parallel
+            parallel_map_helper(task_vec, threads, &all_group_sums);
+        });
+
+        // Combine group sums from all chunks
+        std::vector<uint64_t> total_group_sums(num_groups + 1, 0);
+        for (const auto &chunk_sums : all_group_sums) {
+            for (size_t i = 0; i < chunk_sums.size() && i < total_group_sums.size(); i++) {
+                total_group_sums[i] += chunk_sums[i];
+            }
+        }
+        
+        // Only keep the actual groups (exclude the last "discard" group) - save for later use
+        final_group_sums = std::vector<uint64_t>(total_group_sums.begin(), total_group_sums.begin() + num_groups);
+    } else {
+        // We used precalculated library sizes, but we still need to create the matrix
+        // So we'll run the matrix creation without calculating rowSums (or we can skip rowSums calculation)
+        // Actually, we still need the matrix, so let's run the helper but ignore the returned sums
+        
+        // Vector to store group sums from all chunks (we'll ignore these)
+        std::vector<std::vector<uint64_t>> all_group_sums;
+
+        // Make all the matrix chunks (but we'll ignore the library size calculations)
+        run_with_py_interrupt_check([&fragments_paths,
+                                            &chunk_output_paths,
+                                            &chunk_col_splits,
+                                            &cell_groups_uint,
+                                            &actual_group_names,
+                                            &chr_id,
+                                            &start,
+                                            &chr_len,
+                                            &tile_width,
+                                            &chr_levels,
+                                            &all_group_sums,
+                                            threads,
+                                            chunks](std::atomic<bool> *user_interrupt) {
+            std::vector<std::future<std::vector<uint64_t>>> task_vec;
+            all_group_sums.resize(chunks);
+
+            for (size_t i = 0; i < chunks; i++) {
+                task_vec.push_back(std::async(
+                    std::launch::deferred,
+                    &precalculate_pseudobulk_coverage_helper,
+                    std::cref(fragments_paths),
+                    chunk_output_paths[i],
+                    chunk_col_splits[i],
+
+                    std::cref(cell_groups_uint),
+                    std::cref(actual_group_names),
+
+                    std::cref(chr_id),
+                    std::cref(start),
+                    std::cref(chr_len),
+                    std::cref(tile_width),
+                    std::cref(chr_levels),
+
+                    user_interrupt
+                ));
+            }
+
+            // Process the futures (we'll ignore the results since we have precalculated library sizes)
+            parallel_map_helper(task_vec, threads, nullptr);
+        });
+    }
 
     std::vector<std::unique_ptr<MatrixLoader<uint32_t>>> matrix_chunks;
     for (size_t i = 0; i < chunks; i++) {
@@ -531,7 +704,8 @@ void precalculate_pseudobulk_coverage(
         std_fs::create_directories(std_fs::path(output_path));
     }
     
-    // Write library sizes to JSON format (now using efficient rowSums)
+    // Write library sizes to JSON format
+    // These may be precalculated from import_10x_fragments or calculated from matrix rowSums
     std::string library_size_path = (std_fs::path(output_path) / "library_size.json").string();
     std::ofstream out_file(library_size_path);
     if (!out_file) {
