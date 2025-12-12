@@ -561,10 +561,6 @@ def precalculate_insertion_counts(fragments: Union[str, List[str]], output_dir: 
     
     # Handle pd.Categorical input
     if isinstance(cell_groups, pd.Categorical):
-        # Extract group names from categorical only if not provided by user
-        if group_names is None:
-            group_names = list(cell_groups.categories)
-        
         # Check if this is a filtered categorical (has filtered_cell_indices attribute)
         if hasattr(cell_groups, 'filtered_cell_indices'):
             # Filtered version: create full array with -1 for excluded cells
@@ -572,8 +568,21 @@ def precalculate_insertion_counts(fragments: Union[str, List[str]], output_dir: 
             cell_groups_array = np.full(total_cells, -1, dtype=np.int32)
             # Map filtered cells to their group codes
             cell_groups_array[filtered_indices] = cell_groups.codes.astype(np.int32)
+            
+            # Extract group names from filtered cells only
+            # For filtered categorical, we need to get the unique group names from the filtered cells
+            if group_names is None:
+                # Get the actual values from the filtered categorical (these are the filtered group names)
+                filtered_group_values = list(cell_groups)
+                # Get unique group names in order of appearance
+                # Use dict.fromkeys to preserve order while removing duplicates
+                group_names = list(dict.fromkeys(filtered_group_values))
         else:
             # Full version: all cells included
+            # Extract group names from categorical only if not provided by user
+            if group_names is None:
+                group_names = list(cell_groups.categories)
+            
             if len(cell_groups) != total_cells:
                 if len(fragments_normalized) > 1:
                     raise ValueError(
