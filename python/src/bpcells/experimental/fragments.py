@@ -162,7 +162,7 @@ def build_cell_groups(
     _logger.info("build_cell_groups: Starting cell group construction")
     _logger.info(f"  Fragments: {len(fragments) if isinstance(fragments, list) else 1} fragment(s)")
     _logger.info(f"  Library size filter: {min_library_size} <= lib_size <= {max_library_size}")
-    _logger.info(f"  Group order: {len(group_order)} groups - {group_order[:5]}{'...' if len(group_order) > 5 else ''}")
+    _logger.info(f"  Group order: {len(group_order)} groups")
     
     # Convert single path to list for uniform handling
     if isinstance(fragments, str):
@@ -421,19 +421,18 @@ def build_cell_groups(
     final_categories = valid_categories + remaining
     
     if remaining:
-        _logger.warning(f"  Groups not in group_order but have cells: {remaining}")
+        _logger.warning(f"  {len(remaining)} groups not in group_order but have cells")
     
     # Log group statistics
     _logger.info("Group statistics after filtering:")
-    for group in final_categories:
-        count = stats_by_group.get(group, 0)
-        _logger.info(f"  {group}: {count} cells")
+    total_cells_in_groups = sum(stats_by_group.get(group, 0) for group in final_categories)
+    _logger.info(f"  {len(final_categories)} groups with {total_cells_in_groups} total cells")
     
     # Check for groups in group_order that have no cells
     empty_groups = [g for g in group_order if g not in final_categories]
     if empty_groups:
         _logger.warning(
-            f"  Groups in group_order with no cells (will be excluded from output): {empty_groups}"
+            f"  {len(empty_groups)} groups in group_order with no cells (will be excluded from output)"
         )
     
     # Create categorical with only valid categories (groups that have cells)
