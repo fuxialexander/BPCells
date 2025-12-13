@@ -180,8 +180,23 @@ Eigen::SparseMatrix<uint32_t> load_matrix_subset_helper(
     std::vector<uint32_t> columns,
     std::atomic<bool> *user_interrupt
 ) {
-    std::unique_ptr<MatrixLoader<uint32_t>> mat =
-        std::make_unique<StoredMatrix<uint32_t>>(StoredMatrix<uint32_t>::openPacked(rb));
+    std::unique_ptr<MatrixLoader<uint32_t>> mat;
+    
+    // Check version - experimental matrices use version 9999
+    // Note: This only works for FileReaderBuilder, but that's what we use for load_matrix_dir_subset
+    try {
+        std::string version = rb.readVersion();
+        if (version == StoredMatrix<uint32_t>::versionString(true, 9999)) {
+            // Use experimental reader for version 9999
+            mat = std::make_unique<StoredMatrix<uint32_t>>(EXPERIMENTAL_openPackedSparseColumn<uint32_t>(rb));
+        } else {
+            // Use standard reader for version 2
+            mat = std::make_unique<StoredMatrix<uint32_t>>(StoredMatrix<uint32_t>::openPacked(rb));
+        }
+    } catch (...) {
+        // If readVersion() fails (e.g., for VecReaderWriterBuilder), fall back to standard reader
+        mat = std::make_unique<StoredMatrix<uint32_t>>(StoredMatrix<uint32_t>::openPacked(rb));
+    }
 
     mat = std::make_unique<MatrixColSelect<uint32_t>>(std::move(mat), columns);
     if (rows) {
@@ -256,8 +271,17 @@ std::vector<Eigen::SparseMatrix<uint32_t>> load_matrix_memory_subset(
 
 std::tuple<uint32_t, uint32_t> dims_matrix_dir(std::string matrix_path) {
     FileReaderBuilder rb(matrix_path);
-    std::unique_ptr<MatrixLoader<uint32_t>> mat =
-        std::make_unique<StoredMatrix<uint32_t>>(StoredMatrix<uint32_t>::openPacked(rb));
+    std::unique_ptr<MatrixLoader<uint32_t>> mat;
+    
+    // Check version - experimental matrices use version 9999
+    std::string version = rb.readVersion();
+    if (version == StoredMatrix<uint32_t>::versionString(true, 9999)) {
+        // Use experimental reader for version 9999
+        mat = std::make_unique<StoredMatrix<uint32_t>>(EXPERIMENTAL_openPackedSparseColumn<uint32_t>(rb));
+    } else {
+        // Use standard reader for version 2
+        mat = std::make_unique<StoredMatrix<uint32_t>>(StoredMatrix<uint32_t>::openPacked(rb));
+    }
 
     return {mat->rows(), mat->cols()};
 }

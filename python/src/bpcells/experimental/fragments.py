@@ -25,6 +25,13 @@ else:
 import numpy as np
 import pandas as pd
 
+# Import DirMatrix for binned matrix storage
+try:
+    from .matrix import DirMatrix
+except ImportError:
+    # Fallback if matrix module is not available
+    DirMatrix = None
+
 # Set up logger for build_cell_groups
 _logger = logging.getLogger(__name__)
 
@@ -917,4 +924,194 @@ def precalculate_insertion_counts(fragments: Union[str, List[str]], output_dir: 
         )
     
     return PrecalculatedInsertionMatrix(output_dir)
+
+
+def precalculate_insertion_counts_binned(
+    fragments: Union[str, List[str]], 
+    output_dir: str, 
+    cell_groups: Union[Sequence[int], pd.Categorical],
+    chrom_sizes: Union[str, Dict[str, int]], 
+    bin_size: int = 500,
+    threads: int = 16,
+    group_names: Optional[List[str]] = None
+) -> 'DirMatrix':
+    """Precalculate binned insertion counts from fragment data
+    
+    This function creates a binned genome-wide insertion count matrix where each column
+    represents a genomic bin of size `bin_size` base pairs. The result is stored in
+    BPCells matrix format and can be loaded as a scipy sparse matrix using DirMatrix.
+    
+    The current implementation is EXPERIMENTAL, and will crash for matrices with more than
+    2^32-1 non-zero entries.
+
+    Args:
+        fragments (str | list[str]): Path to a BPCells fragments directory, or list of paths to multiple fragment directories
+        output_dir (str): Path to save the insertion counts in
+        cell_groups (list[int] or pd.Categorical): Pseudobulk groupings as created by :func:`build_cell_groups()`.
+            Should be the output of :func:`build_cell_groups()` to ensure correct cell-to-fragment mapping.
+            When using multiple fragment files, the cell_groups should index across all files combined
+            (e.g., if file1 has 100 cells and file2 has 150 cells, cell_groups should have length 250).
+            If pd.Categorical, group names are taken from the categories.
+        chrom_sizes (str | dict[str, int]): Path/URL of UCSC-style chrom.sizes file, or dictionary mapping chromosome names to sizes
+        bin_size (int): Size of each genomic bin in base pairs. Default is 500bp.
+            The genome will be divided into bins of this size, with each column representing one bin.
+            The bin_size does NOT need to equal the genome size - it's used to bin the genome.
+        threads (int): Number of threads to use during matrix calculation (default = 16, creates threads*4 chunks for parallelization)
+        group_names (list[str], optional): Names for each group in the same order as group indices (0, 1, 2, ...).
+            Ignored if cell_groups is pd.Categorical.
+
+    Returns:
+        DirMatrix: A disk-backed BPCells matrix object. The matrix has shape (n_pseudobulks, n_bins) where:
+            - n_pseudobulks = number of cell groups
+            - n_bins = total number of bins across all chromosomes (sum of ceil(chr_len / bin_size) for each chromosome)
+        
+        You can slice the DirMatrix to get scipy sparse matrices:
+        
+        >>> mat = precalculate_insertion_counts_binned(...)
+        >>> # Get all data as scipy sparse matrix
+        >>> sparse_mat = mat[:, :]  # Returns scipy.sparse.csc_matrix
+        >>> # Get specific rows (pseudobulks) and columns (bins)
+        >>> subset = mat[0:5, 100:200]  # Returns scipy.sparse.csc_matrix
+
+    Examples
+    --------
+    
+    Create a 500bp binned matrix:
+    
+    >>> cell_groups = build_cell_groups(...)
+    >>> mat = precalculate_insertion_counts_binned(
+    ...     fragments="/path/to/fragments",
+    ...     output_dir="/path/to/output",
+    ...     cell_groups=cell_groups,
+    ...     chrom_sizes={"chr1": 248956422, "chr2": 242193529},
+    ...     bin_size=500,
+    ...     threads=8
+    ... )
+    >>> # Access as scipy sparse matrix
+    >>> sparse_mat = mat[:, :]
+    >>> print(f"Matrix shape: {sparse_mat.shape}")  # (n_pseudobulks, n_bins)
+    
+    See Also:
+        :func:`precalculate_insertion_counts` : Per-base (1bp) precalculation
+        :func:`build_cell_groups` : Create cell_groups categorical from fragments
+        :class:`DirMatrix` : Disk-backed matrix interface
+    """
+    if DirMatrix is None:
+        raise ImportError(
+            "DirMatrix is not available. Please ensure bpcells.experimental.matrix is importable."
+        )
+    
+    if bin_size < 1:
+        raise ValueError(f"bin_size must be >= 1, got {bin_size}")
+    
+    # Convert single path to list for uniform handling
+    if isinstance(fragments, str):
+        fragments = [fragments]
+    
+    # Normalize fragment paths to absolute paths for consistency
+    fragments_normalized = [os.path.abspath(os.path.expanduser(f)) for f in fragments]
+    
+    # Validate that cell_groups length matches total cells across fragments
+    # OR that it's a filtered version with filtered_cell_indices attribute
+    total_cells = sum(len(bpcells.cpp.cell_names_fragments_dir(f)) for f in fragments_normalized)
+    
+    # Handle pd.Categorical input (same logic as precalculate_insertion_counts)
+    if isinstance(cell_groups, pd.Categorical):
+        # Check if this is a filtered categorical (has filtered_cell_indices attribute)
+        if hasattr(cell_groups, 'filtered_cell_indices'):
+            # Filtered version: create full array with -1 for excluded cells
+            filtered_indices = cell_groups.filtered_cell_indices
+            cell_groups_array = np.full(total_cells, -1, dtype=np.int32)
+            # Map filtered cells to their group codes
+            cell_groups_array[filtered_indices] = cell_groups.codes.astype(np.int32)
+            
+            # Extract group names from filtered cells only
+            if group_names is None:
+                original_order = getattr(cell_groups, 'original_group_order', None)
+                group_names = _extract_valid_group_names(cell_groups, original_order)
+        else:
+            # Full version: all cells included
+            if group_names is None:
+                original_order = getattr(cell_groups, 'original_group_order', None)
+                if original_order is not None:
+                    group_names = _extract_valid_group_names(cell_groups, original_order)
+                else:
+                    group_names = list(cell_groups.categories)
+            
+            if len(cell_groups) != total_cells:
+                if len(fragments_normalized) > 1:
+                    raise ValueError(
+                        f"cell_groups length ({len(cell_groups)}) does not match total cells across fragments ({total_cells}). "
+                        f"When using multiple fragments, ensure cell_groups was created using build_cell_groups() "
+                        f"with the dict-based API (cell_ids and group_ids as dicts)."
+                    )
+                else:
+                    raise ValueError(
+                        f"cell_groups length ({len(cell_groups)}) does not match number of cells in fragment ({total_cells})."
+                    )
+            cell_groups_array = cell_groups.codes.astype(np.int32)
+            cell_groups_array[cell_groups_array == -1] = -1
+    else:
+        # Non-categorical input: validate length
+        if len(cell_groups) != total_cells:
+            if len(fragments_normalized) > 1:
+                raise ValueError(
+                    f"cell_groups length ({len(cell_groups)}) does not match total cells across fragments ({total_cells}). "
+                    f"When using multiple fragments, ensure cell_groups was created using build_cell_groups() "
+                    f"with the dict-based API (cell_ids and group_ids as dicts)."
+                )
+            else:
+                raise ValueError(
+                    f"cell_groups length ({len(cell_groups)}) does not match number of cells in fragment ({total_cells})."
+                )
+        cell_groups_array = cell_groups
+
+    if isinstance(chrom_sizes, str):
+        chrom_sizes = pd.read_csv(chrom_sizes, sep="\t", names=["chrom", "size"])
+        chrom_sizes = {t.chrom: t.size for t in chrom_sizes.itertuples()}
+
+    # Re-order chrom_sizes to match the fragment file chromosome order (use first file as reference)
+    chrom_order = bpcells.cpp.chr_names_fragments_dir(fragments_normalized[0])
+    chrom_sizes = dict(i for i in chrom_sizes.items() if i[0] in chrom_order)
+    chrom_sizes = dict(sorted(chrom_sizes.items(), key = lambda x: chrom_order.index(x[0])))
+
+    # Calculate chromosome lengths in bins (for metadata)
+    chrom_bin_counts = {chr: (size + bin_size - 1) // bin_size for chr, size in chrom_sizes.items()}
+    total_bins = sum(chrom_bin_counts.values())
+    
+    tmp = tempfile.TemporaryDirectory()
+    
+    # Call C++ function with specified bin_size
+    bpcells.cpp.precalculate_pseudobulk_coverage(
+        fragments_normalized,
+        output_dir,
+        tmp.name,
+        list(chrom_sizes.keys()),
+        list(chrom_sizes.values()),
+        cell_groups_array,
+        bin_size,  # Use the specified bin_size instead of hardcoded 1
+        threads,
+        group_names
+    )
+    
+    # Save metadata about binning
+    metadata = {
+        "bin_size": bin_size,
+        "chrom_sizes": chrom_sizes,
+        "chrom_bin_counts": chrom_bin_counts,
+        "total_bins": total_bins,
+        "group_names": group_names if group_names is not None else []
+    }
+    metadata_path = os.path.join(output_dir, "binning_metadata.json")
+    with open(metadata_path, "w") as f:
+        json.dump(metadata, f, indent=2)
+    
+    # Save group_names.json for consistency
+    if group_names is not None:
+        group_names_path = os.path.join(output_dir, "group_names.json")
+        with open(group_names_path, "w") as f:
+            json.dump(group_names, f, indent=2)
+    
+    # Return DirMatrix object (can be sliced to get scipy sparse matrices)
+    return DirMatrix(output_dir)
 

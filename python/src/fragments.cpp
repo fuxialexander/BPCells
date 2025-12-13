@@ -24,6 +24,7 @@
 #include "bpcells-cpp/matrixIterators/ConcatenateMatrix.h"
 #include "bpcells-cpp/matrixIterators/MatrixIndexSelect.h"
 #include "bpcells-cpp/matrixIterators/StoredMatrixSparseColumn.h"
+#include "bpcells-cpp/matrixIterators/StoredMatrixWriter.h"
 #include "bpcells-cpp/matrixIterators/RenameDims.h"
 #include "bpcells-cpp/matrixIterators/TileMatrix.h"
 #include "bpcells-cpp/utils/filesystem_compat.h"
@@ -312,6 +313,8 @@ static std::vector<uint64_t> precalculate_pseudobulk_coverage_helper(
     const std::vector<uint32_t> &end,
     const std::vector<uint32_t> &width,
     const std::vector<std::string> &chr_levels,
+    
+    int bin_size,
 
     std::atomic<bool> *user_interrupt
 ) {
@@ -408,8 +411,13 @@ static std::vector<uint64_t> precalculate_pseudobulk_coverage_helper(
     );
 
     // Write to output
+    // Use version 9999 (experimental) if bin_size == 1, otherwise use version 2 (standard)
     FileWriterBuilder wb(chunk_output_path);
-    EXPERIMENTAL_createPackedSparseColumn<uint32_t>(wb).write(*tile_mat, user_interrupt);
+    if (bin_size == 1) {
+        EXPERIMENTAL_createPackedSparseColumn<uint32_t>(wb).write(*tile_mat, user_interrupt);
+    } else {
+        StoredMatrixWriter<uint32_t>::createPacked(wb).write(*tile_mat, user_interrupt);
+    }
     
     return group_sums;
 }
@@ -490,9 +498,11 @@ void precalculate_pseudobulk_coverage(
     }
 
     // Split columns into chunks
+    // When bin_size > 1, we need to calculate the actual number of bins (columns)
+    // Each chromosome has ceil(chr_len / bin_size) bins
     size_t total_columns = 0;
     for (const auto &x : chr_len) {
-        total_columns += x;
+        total_columns += (x + bin_size - 1) / bin_size;  // Ceiling division
     }
     uint32_t chunks = std::max<uint32_t>(1, threads * 4);
     std::vector<std::pair<uint32_t,uint32_t>> chunk_col_splits;
@@ -563,7 +573,8 @@ void precalculate_pseudobulk_coverage(
                                             &chr_levels,
                                             &all_group_sums,
                                             threads,
-                                            chunks](std::atomic<bool> *user_interrupt) {
+                                            chunks,
+                                            bin_size](std::atomic<bool> *user_interrupt) {
             std::vector<std::future<std::vector<uint64_t>>> task_vec;
             all_group_sums.resize(chunks);
 
@@ -583,6 +594,7 @@ void precalculate_pseudobulk_coverage(
                     std::cref(chr_len),
                     std::cref(tile_width),
                     std::cref(chr_levels),
+                    bin_size,
 
                     user_interrupt
                 ));
@@ -623,7 +635,8 @@ void precalculate_pseudobulk_coverage(
                                             &chr_levels,
                                             &all_group_sums,
                                             threads,
-                                            chunks](std::atomic<bool> *user_interrupt) {
+                                            chunks,
+                                            bin_size](std::atomic<bool> *user_interrupt) {
             std::vector<std::future<std::vector<uint64_t>>> task_vec;
             all_group_sums.resize(chunks);
 
@@ -643,6 +656,7 @@ void precalculate_pseudobulk_coverage(
                     std::cref(chr_len),
                     std::cref(tile_width),
                     std::cref(chr_levels),
+                    bin_size,
 
                     user_interrupt
                 ));
@@ -654,10 +668,15 @@ void precalculate_pseudobulk_coverage(
         });
     }
 
+    // Read chunks - use version 9999 if bin_size == 1, otherwise use version 2
     std::vector<std::unique_ptr<MatrixLoader<uint32_t>>> matrix_chunks;
     for (size_t i = 0; i < chunks; i++) {
         FileReaderBuilder rb(chunk_output_paths[i]);
-        matrix_chunks.push_back(std::make_unique<StoredMatrix<uint32_t>>(EXPERIMENTAL_openPackedSparseColumn<uint32_t>(rb)));
+        if (bin_size == 1) {
+            matrix_chunks.push_back(std::make_unique<StoredMatrix<uint32_t>>(EXPERIMENTAL_openPackedSparseColumn<uint32_t>(rb)));
+        } else {
+            matrix_chunks.push_back(std::make_unique<StoredMatrix<uint32_t>>(StoredMatrix<uint32_t>::openPacked(rb)));
+        }
     }
 
     std::unique_ptr<MatrixLoader<uint32_t>> full_mat;
@@ -684,13 +703,22 @@ void precalculate_pseudobulk_coverage(
         std::move(full_mat), row_names, empty_col_names, false, true
     );
     
+    // Write final matrix - use version 9999 if bin_size == 1, otherwise use version 2
     FileWriterBuilder wb(output_path);
     
-    run_with_py_interrupt_check(
-        &StoredMatrixWriter<uint32_t>::write,
-        EXPERIMENTAL_createPackedSparseColumn<uint32_t>(wb),
-        std::ref(*full_mat)
-    );
+    if (bin_size == 1) {
+        run_with_py_interrupt_check(
+            &StoredMatrixWriter<uint32_t>::write,
+            EXPERIMENTAL_createPackedSparseColumn<uint32_t>(wb),
+            std::ref(*full_mat)
+        );
+    } else {
+        run_with_py_interrupt_check(
+            &StoredMatrixWriter<uint32_t>::write,
+            StoredMatrixWriter<uint32_t>::createPacked(wb),
+            std::ref(*full_mat)
+        );
+    }
 
     // Windows requires us to close open files before we can delete the temporary paths.
     full_mat.reset();
