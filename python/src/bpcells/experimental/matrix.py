@@ -129,8 +129,14 @@ class DirMatrix:
         if len(set(m._transpose for m in mats)) != 1:
             raise Exception("Not all input matrices have the same on-disk storage order (row-major vs col-major)")
 
-        if len(set(m.shape[0] for m in mats)) != 1:
-            raise Exception("Not all input matrices have same number of rows")
+        # For hstack (horizontal/column-wise): need same rows
+        # For vstack (vertical/row-wise): need same columns
+        if is_horizontal:
+            if len(set(m.shape[0] for m in mats)) != 1:
+                raise Exception("Not all input matrices have same number of rows (required for hstack)")
+        else:
+            if len(set(m.shape[1] for m in mats)) != 1:
+                raise Exception("Not all input matrices have same number of columns (required for vstack)")
         
         apply_transpose = mats[0]._transpose
 
