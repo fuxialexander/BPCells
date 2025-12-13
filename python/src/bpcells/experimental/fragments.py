@@ -10,6 +10,7 @@ import bpcells
 import bpcells.cpp
 
 import json
+import logging
 import tempfile
 import os.path
 import warnings
@@ -23,6 +24,44 @@ else:
 
 import numpy as np
 import pandas as pd
+
+# Set up logger for build_cell_groups
+_logger = logging.getLogger(__name__)
+
+def _extract_valid_group_names(cell_groups: pd.Categorical, group_order: Optional[Sequence[str]] = None) -> List[str]:
+    """Extract valid group names from a categorical, preserving order from group_order.
+    
+    This function ensures that only groups that actually have cells are included,
+    and preserves the order from group_order if provided. This is critical for
+    maintaining consistency between group_names, library_size, and matrix shape.
+    
+    Args:
+        cell_groups: pd.Categorical with group assignments
+        group_order: Optional original group_order used to create the categorical.
+            If provided, preserves this order for groups that have cells.
+    
+    Returns:
+        List of group names that actually have cells, in order from group_order
+        (or order of appearance if group_order not provided).
+    """
+    # Get unique groups that actually have cells (non-NaN values)
+    if hasattr(cell_groups, 'filtered_cell_indices'):
+        # For filtered categoricals, get the actual values
+        valid_groups = list(dict.fromkeys(cell_groups))
+    else:
+        # For full categoricals, get unique non-NaN values
+        valid_groups = [g for g in cell_groups.categories if g in cell_groups.dropna().unique()]
+    
+    # If group_order is provided, preserve its order for groups that have cells
+    if group_order is not None:
+        # Create ordered list: groups in group_order that are in valid_groups
+        ordered_valid = [g for g in group_order if g in valid_groups]
+        # Add any remaining valid groups not in group_order (shouldn't happen, but be safe)
+        remaining = [g for g in valid_groups if g not in ordered_valid]
+        return ordered_valid + remaining
+    
+    # Otherwise, return in order of appearance
+    return valid_groups
 
 def import_10x_fragments(input: str, output: str, shift_start: int = 0, shift_end: int = 0, keeper_cells: Optional[List[str]] = None):
     """Convert 10x fragment file to BPCells format
@@ -71,11 +110,20 @@ def build_cell_groups(
 
     Returns:
         pd.Categorical:
-        Pandas Categorical suitable as input for ``cell_groups`` in :func:`pseudobulk_insertion_counts()`.
-        Same length as total number of cells in the ``fragments`` input, specifying the output
-        pseudobulk group for each cell (or NaN if the cell is excluded from consideration).
-        When using multiple fragment files, the categorical covers all cells across all files.
-        The categories are ordered according to ``group_order``.
+        Pandas Categorical suitable as input for ``cell_groups`` in :func:`precalculate_insertion_counts()`.
+        The categorical has the following properties:
+        - Length equals total number of cells in the ``fragments`` input
+        - Contains group assignments for each cell (or NaN if the cell is excluded from consideration)
+        - Categories include ONLY groups that have at least one cell after filtering
+        - Categories are ordered according to ``group_order`` (groups not in group_order are appended)
+        - When using multiple fragment files, the categorical covers all cells across all files
+        
+        The categorical has two attributes:
+        - ``filtered_cell_indices``: Array of global cell indices that passed filtering
+        - ``original_group_order``: Original group_order used to create the categorical (for consistency)
+        
+        **Important**: The categorical only includes categories for groups that actually have cells.
+        This ensures consistency between group_names, library_size, and matrix shape in the output.
 
     Examples:
         Single fragment (list-based API):
@@ -103,18 +151,30 @@ def build_cell_groups(
     See Also:
         :func:`pseudobulk_insertion_counts`
     """
+    _logger.info("=" * 80)
+    _logger.info("build_cell_groups: Starting cell group construction")
+    _logger.info(f"  Fragments: {len(fragments) if isinstance(fragments, list) else 1} fragment(s)")
+    _logger.info(f"  Library size filter: {min_library_size} <= lib_size <= {max_library_size}")
+    _logger.info(f"  Group order: {len(group_order)} groups - {group_order[:5]}{'...' if len(group_order) > 5 else ''}")
+    
     # Convert single path to list for uniform handling
     if isinstance(fragments, str):
         fragments = [fragments]
     
     # Normalize fragment paths to absolute paths for consistent matching
     fragments_normalized = [os.path.abspath(os.path.expanduser(f)) for f in fragments]
+    _logger.debug(f"  Normalized fragment paths: {[os.path.basename(f) for f in fragments_normalized]}")
 
     # Determine if using dict-based API (for multiple fragments) or list-based API
     using_dict_api = isinstance(cell_ids, dict)
+    _logger.info(f"  API mode: {'dict-based' if using_dict_api else 'list-based'}")
     
     # Warn if list-based API is used with multiple fragments
     if not using_dict_api and len(fragments_normalized) > 1:
+        _logger.warning(
+            "List-based API (cell_ids as list) used with multiple fragments. "
+            "This may cause incorrect cell-to-fragment mapping. Consider using dict-based API."
+        )
         warnings.warn(
             "List-based API (cell_ids as list) should only be used with a single fragment file. "
             "For multiple fragments, use the dict-based API where cell_ids and group_ids are dicts "
@@ -136,41 +196,60 @@ def build_cell_groups(
         # Validate that all fragment paths have corresponding entries
         missing_frags = set(fragments_normalized) - set(cell_ids_normalized.keys())
         if missing_frags:
+            _logger.error(f"Missing cell_ids entries for fragments: {missing_frags}")
             raise ValueError(f"Missing cell_ids entries for fragments: {missing_frags}")
         missing_frags = set(fragments_normalized) - set(group_ids_normalized.keys())
         if missing_frags:
+            _logger.error(f"Missing group_ids entries for fragments: {missing_frags}")
             raise ValueError(f"Missing group_ids entries for fragments: {missing_frags}")
         
         # Validate lengths match for each fragment
         for frag_path in fragments_normalized:
-            if len(cell_ids_normalized[frag_path]) != len(group_ids_normalized[frag_path]):
+            cell_count = len(cell_ids_normalized[frag_path])
+            group_count = len(group_ids_normalized[frag_path])
+            if cell_count != group_count:
+                _logger.error(
+                    f"Fragment {os.path.basename(frag_path)}: cell_ids length ({cell_count}) != "
+                    f"group_ids length ({group_count})"
+                )
                 raise ValueError(
                     f"cell_ids and group_ids must have same length for fragment {frag_path}. "
-                    f"Got {len(cell_ids_normalized[frag_path])} and {len(group_ids_normalized[frag_path])}"
+                    f"Got {cell_count} and {group_count}"
                 )
+            _logger.debug(f"  Fragment {os.path.basename(frag_path)}: {cell_count} cells")
     else:
         # List-based API: cell_ids and group_ids are sequences
         if isinstance(group_ids, dict):
+            _logger.error("Type mismatch: cell_ids is list but group_ids is dict")
             raise TypeError("When cell_ids is a list, group_ids must also be a list")
         if len(cell_ids) != len(group_ids):
+            _logger.error(f"Length mismatch: cell_ids ({len(cell_ids)}) != group_ids ({len(group_ids)})")
             raise ValueError(f"cell_ids and group_ids must have same length. Got {len(cell_ids)} and {len(group_ids)}")
+        _logger.debug(f"  List-based API: {len(cell_ids)} cells")
 
     # Build cell index lookup across all fragment files
     # Track cells in order across fragments to preserve fragment context for duplicate barcodes
     # Sequential matching is O(total_cells) which is optimal since we iterate through all cells anyway
+    _logger.info("Loading cells from fragment files...")
     cell_sequence = []  # List of (frag_path, cell_name, global_index, frag_local_index) in order across all fragments
     current_index = 0
+    frag_cell_counts = {}
     for frag_path in fragments_normalized:
         frag_local_index = 0
-        for cell_name in bpcells.cpp.cell_names_fragments_dir(frag_path):
+        frag_cells = list(bpcells.cpp.cell_names_fragments_dir(frag_path))
+        frag_cell_counts[frag_path] = len(frag_cells)
+        for cell_name in frag_cells:
             cell_sequence.append((frag_path, cell_name, current_index, frag_local_index))
             current_index += 1
             frag_local_index += 1
+        _logger.debug(f"  Fragment {os.path.basename(frag_path)}: {len(frag_cells)} cells")
 
     # Total number of cells across all fragments
     total_cells = current_index
+    _logger.info(f"Total cells across all fragments: {total_cells}")
 
     # Load library sizes from each fragment directory
+    _logger.info("Loading library sizes for filtering...")
     frag_library_sizes = {}  # Map from frag_path to array of library sizes
     for frag_path in fragments_normalized:
         library_size_path = os.path.join(frag_path, "library_size.json")
@@ -180,18 +259,41 @@ def build_cell_groups(
                     data = json.load(f)
                     if isinstance(data, dict) and "library_sizes" in data:
                         frag_library_sizes[frag_path] = np.array(data["library_sizes"], dtype=np.uint64)
+                        _logger.debug(
+                            f"  Fragment {os.path.basename(frag_path)}: loaded {len(frag_library_sizes[frag_path])} library sizes"
+                        )
+                    else:
+                        _logger.warning(f"  Fragment {os.path.basename(frag_path)}: invalid library_size.json format")
             except (json.JSONDecodeError, KeyError, ValueError) as e:
+                _logger.warning(
+                    f"  Fragment {os.path.basename(frag_path)}: could not load library sizes: {e}. "
+                    f"Library size filtering will be skipped for this fragment."
+                )
                 warnings.warn(
                     f"Could not load library sizes from {library_size_path}: {e}. "
                     f"Library size filtering will be skipped for this fragment.",
                     UserWarning,
                     stacklevel=2
                 )
+        else:
+            _logger.debug(f"  Fragment {os.path.basename(frag_path)}: no library_size.json found, skipping library size filter")
+    
+    if frag_library_sizes:
+        _logger.info(f"Library sizes loaded for {len(frag_library_sizes)}/{len(fragments_normalized)} fragments")
+    else:
+        _logger.info("No library sizes found - library size filtering will be skipped")
 
     # Create array of group assignments - only include cells that pass filters
     # Track which cells are included (filtered_cell_indices) and their group assignments
+    _logger.info("Matching cells and applying filters...")
     filtered_cell_groups = []
     filtered_cell_indices = []  # Maps filtered index -> global cell index in fragments
+    
+    # Statistics for logging
+    stats_matched = 0
+    stats_unmatched = 0
+    stats_filtered_libsize = 0
+    stats_by_group = {}
 
     if using_dict_api:
         # Dict-based API: match cells per fragment
@@ -207,13 +309,16 @@ def build_cell_groups(
             unique_groups = set(group_list)
             if not unique_groups <= set(group_order):
                 missing = unique_groups - set(group_order)
+                _logger.error(f"Fragment {os.path.basename(frag_path)}: groups not in group_order: {missing}")
                 raise ValueError(f"group_ids contains groups not in group_order: {missing}")
+            _logger.debug(f"  Fragment {os.path.basename(frag_path)}: {len(cell_list)} cells, {len(unique_groups)} unique groups")
         
         # Match cells using fragment-specific lookup
         for frag_path, cell_name, global_idx, frag_local_idx in cell_sequence:
             if frag_path in frag_cell_maps and cell_name in frag_cell_maps[frag_path]:
                 # Match found - check library size filter if available
                 group_id = frag_cell_maps[frag_path][cell_name]
+                stats_matched += 1
                 
                 # Apply library size filter if library sizes are available
                 if frag_path in frag_library_sizes:
@@ -221,18 +326,29 @@ def build_cell_groups(
                         lib_size = frag_library_sizes[frag_path][frag_local_idx]
                         if lib_size < min_library_size or lib_size > max_library_size:
                             # Library size outside range - skip this cell entirely
+                            stats_filtered_libsize += 1
                             continue
+                    else:
+                        _logger.warning(
+                            f"  Cell {cell_name} at index {frag_local_idx} >= library_size array length "
+                            f"({len(frag_library_sizes[frag_path])}) for fragment {os.path.basename(frag_path)}"
+                        )
                 
                 # Cell passes filter - include it
                 filtered_cell_groups.append(group_id)
                 filtered_cell_indices.append(global_idx)
+                stats_by_group[group_id] = stats_by_group.get(group_id, 0) + 1
+            else:
+                stats_unmatched += 1
     else:
         # List-based API: name-based lookup (backward compatible)
         # Validate that all group_ids are in group_order
         unique_groups = set(group_ids)
         if not unique_groups <= set(group_order):
             missing = unique_groups - set(group_order)
+            _logger.error(f"Groups not in group_order: {missing}")
             raise ValueError(f"group_ids contains groups not in group_order: {missing}")
+        _logger.debug(f"  List-based API: {len(cell_ids)} cells, {len(unique_groups)} unique groups")
         
         # Create name-based lookup: cell_id -> group_id
         # This preserves backward compatibility - cells can be in any order
@@ -246,6 +362,7 @@ def build_cell_groups(
             if cell_name in cell_to_group:
                 # Match found - check library size filter if available
                 group_id = cell_to_group[cell_name]
+                stats_matched += 1
                 
                 # Apply library size filter if library sizes are available
                 if frag_path in frag_library_sizes:
@@ -253,16 +370,75 @@ def build_cell_groups(
                         lib_size = frag_library_sizes[frag_path][frag_local_idx]
                         if lib_size < min_library_size or lib_size > max_library_size:
                             # Library size outside range - skip this cell entirely
+                            stats_filtered_libsize += 1
                             continue
+                    else:
+                        _logger.warning(
+                            f"  Cell {cell_name} at index {frag_local_idx} >= library_size array length "
+                            f"({len(frag_library_sizes[frag_path])}) for fragment {os.path.basename(frag_path)}"
+                        )
                 
                 # Cell passes filter - include it
                 filtered_cell_groups.append(group_id)
                 filtered_cell_indices.append(global_idx)
+                stats_by_group[group_id] = stats_by_group.get(group_id, 0) + 1
+            else:
+                stats_unmatched += 1
 
-    # Create categorical with ordered categories - only includes filtered cells
-    # Store filtered_cell_indices as an attribute for use in precalculate_insertion_counts
-    cat = pd.Categorical(filtered_cell_groups, categories=group_order, ordered=True)
+    # Log matching statistics
+    _logger.info("Cell matching statistics:")
+    _logger.info(f"  Matched cells: {stats_matched}/{total_cells} ({100*stats_matched/total_cells:.1f}%)")
+    if stats_unmatched > 0:
+        _logger.warning(f"  Unmatched cells: {stats_unmatched} (cells in fragments but not in cell_ids)")
+    if stats_filtered_libsize > 0:
+        _logger.info(f"  Filtered by library size: {stats_filtered_libsize} cells")
+    _logger.info(f"  Final filtered cells: {len(filtered_cell_groups)}")
+    
+    if len(filtered_cell_groups) == 0:
+        _logger.error("No cells passed filtering! Check cell_ids, group_ids, and library size filters.")
+        raise ValueError(
+            "No cells passed filtering. This can happen if:\n"
+            "  1. No cells in cell_ids match cells in fragments\n"
+            "  2. All cells were filtered out by library size constraints\n"
+            f"  Library size filter: {min_library_size} <= lib_size <= {max_library_size}"
+        )
+    
+    # Determine which groups actually have cells after filtering
+    unique_filtered_groups = list(dict.fromkeys(filtered_cell_groups))
+    
+    # Only include categories that actually have cells, but preserve order from group_order
+    # This ensures consistency: categories match the groups that will be in the output matrix
+    valid_categories = [g for g in group_order if g in unique_filtered_groups]
+    # Add any groups not in group_order (shouldn't happen if validation worked, but be safe)
+    remaining = [g for g in unique_filtered_groups if g not in valid_categories]
+    final_categories = valid_categories + remaining
+    
+    if remaining:
+        _logger.warning(f"  Groups not in group_order but have cells: {remaining}")
+    
+    # Log group statistics
+    _logger.info("Group statistics after filtering:")
+    for group in final_categories:
+        count = stats_by_group.get(group, 0)
+        _logger.info(f"  {group}: {count} cells")
+    
+    # Check for groups in group_order that have no cells
+    empty_groups = [g for g in group_order if g not in final_categories]
+    if empty_groups:
+        _logger.warning(
+            f"  Groups in group_order with no cells (will be excluded from output): {empty_groups}"
+        )
+    
+    # Create categorical with only valid categories (groups that have cells)
+    # Store filtered_cell_indices and original group_order as attributes for use in precalculate_insertion_counts
+    _logger.info(f"Creating categorical with {len(final_categories)} groups (from {len(group_order)} in group_order)")
+    cat = pd.Categorical(filtered_cell_groups, categories=final_categories, ordered=True)
     cat.filtered_cell_indices = np.array(filtered_cell_indices, dtype=np.int32)
+    cat.original_group_order = list(group_order)  # Store for later use in precalculate_insertion_counts
+    
+    _logger.info("=" * 80)
+    _logger.info(f"build_cell_groups: Complete - {len(filtered_cell_groups)} cells in {len(final_categories)} groups")
+    
     return cat
 
 def pseudobulk_insertion_counts(fragments: str, regions: pd.DataFrame, cell_groups: Union[Sequence[int], pd.Categorical], bin_size: int = 1) -> np.ndarray:
@@ -569,19 +745,24 @@ def precalculate_insertion_counts(fragments: Union[str, List[str]], output_dir: 
             # Map filtered cells to their group codes
             cell_groups_array[filtered_indices] = cell_groups.codes.astype(np.int32)
             
-            # Extract group names from filtered cells only
-            # For filtered categorical, we need to get the unique group names from the filtered cells
+            # Extract group names from filtered cells only, preserving order from original group_order
+            # This ensures consistency: group_names matches the actual groups in the matrix
             if group_names is None:
-                # Get the actual values from the filtered categorical (these are the filtered group names)
-                filtered_group_values = list(cell_groups)
-                # Get unique group names in order of appearance
-                # Use dict.fromkeys to preserve order while removing duplicates
-                group_names = list(dict.fromkeys(filtered_group_values))
+                # Use original_group_order if available (from build_cell_groups), otherwise use categories
+                original_order = getattr(cell_groups, 'original_group_order', None)
+                group_names = _extract_valid_group_names(cell_groups, original_order)
         else:
             # Full version: all cells included
             # Extract group names from categorical only if not provided by user
             if group_names is None:
-                group_names = list(cell_groups.categories)
+                # Use original_group_order if available, otherwise use categories
+                original_order = getattr(cell_groups, 'original_group_order', None)
+                if original_order is not None:
+                    # Only include categories that actually have cells
+                    group_names = _extract_valid_group_names(cell_groups, original_order)
+                else:
+                    # Fall back to all categories (backward compatibility)
+                    group_names = list(cell_groups.categories)
             
             if len(cell_groups) != total_cells:
                 if len(fragments_normalized) > 1:
@@ -636,6 +817,8 @@ def precalculate_insertion_counts(fragments: Union[str, List[str]], output_dir: 
 
     # Filter library_size.json if we had filtered cells
     # The C++ code may write library sizes for all groups, but we only want filtered ones
+    # IMPORTANT: group_names should already be filtered to only include groups with cells,
+    # so we need to ensure library_size matches group_names length
     if isinstance(cell_groups, pd.Categorical) and hasattr(cell_groups, 'filtered_cell_indices'):
         library_size_path = os.path.join(output_dir, "library_size.json")
         if os.path.exists(library_size_path):
@@ -644,23 +827,45 @@ def precalculate_insertion_counts(fragments: Union[str, List[str]], output_dir: 
                     data = json.load(f)
                     if isinstance(data, dict) and "library_sizes" in data:
                         all_library_sizes = data["library_sizes"]
-                        # Get the unique group IDs from filtered cells (these are the codes)
-                        # For single_sparse, each cell is its own group, so codes are 0, 1, 2, ...
-                        # For celltype_dense, codes map to celltype indices
-                        unique_group_ids = sorted(set(cell_groups.codes))
-                        # Filter library sizes to only include groups that exist in filtered cells
-                        # The C++ code writes library sizes indexed by group_id, so we need to extract
-                        # only the library sizes for groups that exist in our filtered cell_groups
-                        filtered_library_sizes = []
-                        for group_id in unique_group_ids:
-                            if group_id >= 0 and group_id < len(all_library_sizes):
-                                filtered_library_sizes.append(all_library_sizes[group_id])
                         
-                        # Only rewrite if we filtered out some library sizes
-                        if len(filtered_library_sizes) < len(all_library_sizes):
+                        # Map group_names to their codes in the categorical
+                        # The C++ code writes library sizes in the order of group_names passed to it,
+                        # which should match the order of categories in the categorical
+                        # But we need to ensure we only keep library sizes for groups that have cells
+                        category_to_code = {cat: code for code, cat in enumerate(cell_groups.categories)}
+                        
+                        # Get unique codes for groups that actually have cells (non-NaN codes)
+                        unique_codes = sorted(set(cell_groups.codes[cell_groups.codes >= 0]))
+                        
+                        # Extract library sizes for these codes
+                        # The C++ code writes library sizes in the order of group_names we pass,
+                        # which should match the categorical categories order
+                        filtered_library_sizes = []
+                        for code in unique_codes:
+                            if code >= 0 and code < len(all_library_sizes):
+                                filtered_library_sizes.append(all_library_sizes[code])
+                        
+                        # Validate: library_size length should match group_names length
+                        if len(filtered_library_sizes) != len(group_names):
+                            import warnings
+                            warnings.warn(
+                                f"Library size count ({len(filtered_library_sizes)}) does not match "
+                                f"group_names count ({len(group_names)}). This may indicate a mismatch "
+                                f"between categorical categories and group_names. "
+                                f"Using library sizes for {len(unique_codes)} groups.",
+                                UserWarning,
+                                stacklevel=2
+                            )
+                            # Use the filtered library sizes anyway (better than nothing)
                             data["library_sizes"] = filtered_library_sizes
-                            with open(library_size_path, "w") as f:
-                                json.dump(data, f, indent=2)
+                        else:
+                            # Only rewrite if we filtered out some library sizes
+                            if len(filtered_library_sizes) < len(all_library_sizes):
+                                data["library_sizes"] = filtered_library_sizes
+                        
+                        # Write the filtered library sizes
+                        with open(library_size_path, "w") as f:
+                            json.dump(data, f, indent=2)
             except Exception as e:
                 import warnings
                 warnings.warn(
@@ -671,5 +876,45 @@ def precalculate_insertion_counts(fragments: Union[str, List[str]], output_dir: 
 
     chrom_offsets = dict(zip(chrom_sizes.keys(), [0] + np.cumsum(list(chrom_sizes.values()))[:-1].tolist()))
     json.dump(chrom_offsets, open(f"{output_dir}/chrom_offsets.json", "w"), indent=2)
+    
+    # Save group_names.json to ensure consistency and easy access
+    # This helps downstream code verify that group_names, library_size, and matrix shape match
+    if group_names is not None:
+        group_names_path = os.path.join(output_dir, "group_names.json")
+        with open(group_names_path, "w") as f:
+            json.dump(group_names, f, indent=2)
+    
+    # Validate consistency: matrix shape should match group_names length
+    try:
+        matrix = PrecalculatedInsertionMatrix(output_dir)
+        if group_names is not None and matrix.shape[0] != len(group_names):
+            import warnings
+            warnings.warn(
+                f"Inconsistency detected: matrix has {matrix.shape[0]} rows but group_names has "
+                f"{len(group_names)} entries. This may indicate an issue with group filtering. "
+                f"Matrix shape: {matrix.shape}, group_names: {group_names[:5]}... (showing first 5)",
+                UserWarning,
+                stacklevel=2
+            )
+        # Also validate library_size length
+        if hasattr(matrix, 'library_size') and matrix.library_size is not None:
+            if len(matrix.library_size) != matrix.shape[0]:
+                import warnings
+                warnings.warn(
+                    f"Inconsistency detected: library_size has {len(matrix.library_size)} entries "
+                    f"but matrix has {matrix.shape[0]} rows. This may indicate an issue with "
+                    f"library size filtering.",
+                    UserWarning,
+                    stacklevel=2
+                )
+    except Exception as e:
+        # Don't fail if validation fails, just warn
+        import warnings
+        warnings.warn(
+            f"Could not validate matrix consistency: {e}",
+            UserWarning,
+            stacklevel=2
+        )
+    
     return PrecalculatedInsertionMatrix(output_dir)
 
