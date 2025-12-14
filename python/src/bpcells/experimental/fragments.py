@@ -270,9 +270,9 @@ def build_cell_groups(
                             f"  Fragment {os.path.basename(frag_path)}: loaded {len(frag_library_sizes[frag_path])} library sizes"
                         )
                     else:
-                        _logger.warning(f"  Fragment {os.path.basename(frag_path)}: invalid library_size.json format")
+                        _logger.info(f"  Fragment {os.path.basename(frag_path)}: invalid library_size.json format")
             except (json.JSONDecodeError, KeyError, ValueError) as e:
-                _logger.warning(
+                _logger.info(
                     f"  Fragment {os.path.basename(frag_path)}: could not load library sizes: {e}. "
                     f"Library size filtering will be skipped for this fragment."
                 )
@@ -336,7 +336,7 @@ def build_cell_groups(
                             stats_filtered_libsize += 1
                             continue
                     else:
-                        _logger.warning(
+                        _logger.info(
                             f"  Cell {cell_name} at index {frag_local_idx} >= library_size array length "
                             f"({len(frag_library_sizes[frag_path])}) for fragment {os.path.basename(frag_path)}"
                         )
@@ -380,7 +380,7 @@ def build_cell_groups(
                             stats_filtered_libsize += 1
                             continue
                     else:
-                        _logger.warning(
+                        _logger.info(
                             f"  Cell {cell_name} at index {frag_local_idx} >= library_size array length "
                             f"({len(frag_library_sizes[frag_path])}) for fragment {os.path.basename(frag_path)}"
                         )
@@ -396,7 +396,7 @@ def build_cell_groups(
     _logger.info("Cell matching statistics:")
     _logger.info(f"  Matched cells: {stats_matched}/{total_cells} ({100*stats_matched/total_cells:.1f}%)")
     if stats_unmatched > 0:
-        _logger.warning(f"  Unmatched cells: {stats_unmatched} (cells in fragments but not in cell_ids)")
+        _logger.info(f"  Unmatched cells: {stats_unmatched} (cells in fragments but not in cell_ids)")
     if stats_filtered_libsize > 0:
         _logger.info(f"  Filtered by library size: {stats_filtered_libsize} cells")
     _logger.info(f"  Final filtered cells: {len(filtered_cell_groups)}")
@@ -421,7 +421,7 @@ def build_cell_groups(
     final_categories = valid_categories + remaining
     
     if remaining:
-        _logger.warning(f"  {len(remaining)} groups not in group_order but have cells")
+        _logger.info(f"  {len(remaining)} groups not in group_order but have cells")
     
     # Log group statistics
     _logger.info("Group statistics after filtering:")
@@ -431,7 +431,7 @@ def build_cell_groups(
     # Check for groups in group_order that have no cells
     empty_groups = [g for g in group_order if g not in final_categories]
     if empty_groups:
-        _logger.warning(
+        _logger.info(
             f"  {len(empty_groups)} groups in group_order with no cells (will be excluded from output)"
         )
     
