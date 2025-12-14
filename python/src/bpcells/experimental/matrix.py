@@ -11,7 +11,7 @@ import bpcells.cpp
 
 import copy
 import os.path
-from typing import List
+from typing import List, Optional
 
 import numpy as np
 import scipy
@@ -88,6 +88,101 @@ class DirMatrix:
         else:
             return res
     
+    @staticmethod
+    def calculate_safe_chunk_size(rows: int, max_chunk_size: int = 10000) -> int:
+        """Calculate safe chunk size for column slicing to avoid uint32_t overflow.
+        
+        When loading large matrices with many rows, slicing too many columns at once
+        can cause uint32_t overflow in the C++ backend, leading to segfaults.
+        This function calculates the maximum safe number of columns to load at once.
+        
+        Args:
+            rows: Number of rows in the matrix
+            max_chunk_size: Maximum desired chunk size (default: 10000).
+                The actual chunk size will be min(max_chunk_size, safe_limit).
+        
+        Returns:
+            Safe chunk size (number of columns) that won't cause uint32_t overflow.
+            The calculation ensures rows * chunk_size <= UINT32_MAX * 0.9 to account
+            for internal C++ calculations.
+        
+        Examples:
+            >>> mat = DirMatrix("/path/to/matrix")
+            >>> rows, cols = mat.shape
+            >>> chunk_size = DirMatrix.calculate_safe_chunk_size(rows)
+            >>> # Load in chunks
+            >>> for start_col in range(0, cols, chunk_size):
+            ...     chunk = mat[:, start_col:start_col + chunk_size]
+        """
+        UINT32_MAX = 2**32 - 1
+        # Use 90% of max to be safe (account for any internal calculations)
+        max_safe_chunk_size = int((UINT32_MAX * 0.9) // rows)
+        return min(max_chunk_size, max_safe_chunk_size)
+    
+    def load_chunked_columns(
+        self, 
+        start_col: int = 0, 
+        end_col: Optional[int] = None,
+        chunk_size: Optional[int] = None,
+        format: str = 'csr'
+    ) -> List[scipy.sparse.spmatrix]:
+        """Load matrix columns in chunks to avoid uint32_t overflow.
+        
+        This method automatically calculates safe chunk sizes and loads columns
+        in chunks, returning a list of sparse matrices that can be concatenated
+        with scipy.sparse.hstack().
+        
+        Args:
+            start_col: Starting column index (default: 0)
+            end_col: Ending column index (default: all columns)
+            chunk_size: Chunk size in columns. If None, automatically calculated
+                using calculate_safe_chunk_size().
+            format: Sparse matrix format for returned chunks ('csr', 'csc', 'coo').
+                Default: 'csr'
+        
+        Returns:
+            List of sparse matrices, one per chunk. Each matrix has shape
+            (rows, chunk_cols) where chunk_cols may vary for the last chunk.
+        
+        Examples:
+            >>> mat = DirMatrix("/path/to/large_matrix")
+            >>> chunks = mat.load_chunked_columns()
+            >>> combined = scipy.sparse.hstack(chunks, format='csr')
+        """
+        rows, cols = self.shape
+        
+        if end_col is None:
+            end_col = cols
+        
+        if chunk_size is None:
+            chunk_size = self.calculate_safe_chunk_size(rows)
+        
+        # Validate chunk size won't cause overflow
+        UINT32_MAX = 2**32 - 1
+        potential_elements = rows * chunk_size
+        if potential_elements > UINT32_MAX:
+            raise ValueError(
+                f"Chunk size {chunk_size} would cause uint32_t overflow: "
+                f"rows ({rows:,}) × chunk_size ({chunk_size:,}) = {potential_elements:,} > {UINT32_MAX:,}"
+            )
+        
+        chunks = []
+        for start in range(start_col, end_col, chunk_size):
+            end = min(start + chunk_size, end_col)
+            chunk = self[:, start:end]
+            
+            # Convert to requested format
+            if format == 'csr':
+                chunks.append(chunk.tocsr())
+            elif format == 'csc':
+                chunks.append(chunk.tocsc())
+            elif format == 'coo':
+                chunks.append(chunk.tocoo())
+            else:
+                raise ValueError(f"Unsupported format: {format}. Use 'csr', 'csc', or 'coo'")
+        
+        return chunks
+    
     @classmethod
     def from_scipy_sparse(cls, scipy_mat: scipy.sparse.spmatrix, dir: str) -> 'DirMatrix':
         """Create a DirMatrix from a scipy sparse matrix.
@@ -137,6 +232,69 @@ class DirMatrix:
         else:
             if len(set(m.shape[1] for m in mats)) != 1:
                 raise Exception("Not all input matrices have same number of columns (required for vstack)")
+        
+        # Validate dimensions to prevent uint32_t overflow
+        # uint32_t max value is 2^32 - 1 = 4,294,967,295
+        UINT32_MAX = 2**32 - 1
+        
+        if is_horizontal:
+            # For hstack: concatenating columns, so check total columns
+            total_cols = sum(m.shape[1] for m in mats)
+            if total_cols > UINT32_MAX:
+                raise ValueError(
+                    f"Total columns ({total_cols:,}) exceeds uint32_t maximum ({UINT32_MAX:,}). "
+                    f"This would cause overflow in C++ code. Consider splitting into smaller chunks."
+                )
+            # Check individual matrix dimensions
+            for i, m in enumerate(mats):
+                if m.shape[0] > UINT32_MAX or m.shape[1] > UINT32_MAX:
+                    raise ValueError(
+                        f"Matrix {i} has dimensions ({m.shape[0]:,}, {m.shape[1]:,}) "
+                        f"exceeding uint32_t maximum ({UINT32_MAX:,})"
+                    )
+            # For hstack (ConcatCols), check for potential column offset overflow
+            # Column offsets are used for seeking, check if any intermediate sum would overflow
+            running_total = 0
+            for i, m in enumerate(mats):
+                cols = m.shape[1]
+                if running_total > UINT32_MAX - cols:
+                    raise ValueError(
+                        f"Column offset overflow: after matrix {i}, running total ({running_total:,}) + "
+                        f"columns ({cols:,}) would exceed uint32_t maximum ({UINT32_MAX:,})"
+                    )
+                running_total += cols
+        else:
+            # For vstack: concatenating rows, so check total rows
+            total_rows = sum(m.shape[0] for m in mats)
+            if total_rows > UINT32_MAX:
+                raise ValueError(
+                    f"Total rows ({total_rows:,}) exceeds uint32_t maximum ({UINT32_MAX:,}). "
+                    f"This would cause overflow in C++ code. Consider splitting into smaller chunks."
+                )
+            # Check individual matrix dimensions
+            for i, m in enumerate(mats):
+                if m.shape[0] > UINT32_MAX or m.shape[1] > UINT32_MAX:
+                    raise ValueError(
+                        f"Matrix {i} has dimensions ({m.shape[0]:,}, {m.shape[1]:,}) "
+                        f"exceeding uint32_t maximum ({UINT32_MAX:,})"
+                    )
+            # For vstack (ConcatRows), check for potential row index overflow
+            # Row indices in the data are 0-based (0 to rows-1), and we add row_offset
+            # The maximum final row index = (max_rows_in_last_matrix - 1) + row_offset_for_last_matrix
+            # = (max_rows_in_last_matrix - 1) + (total_rows - max_rows_in_last_matrix)
+            # = total_rows - 1
+            # So if total_rows <= UINT32_MAX, we're safe. But we also need to check intermediate
+            # calculations don't overflow during offset accumulation.
+            # Check if any intermediate sum would overflow
+            running_total = 0
+            for i, m in enumerate(mats):
+                rows = m.shape[0]
+                if running_total > UINT32_MAX - rows:
+                    raise ValueError(
+                        f"Row offset overflow: after matrix {i}, running total ({running_total:,}) + "
+                        f"rows ({rows:,}) would exceed uint32_t maximum ({UINT32_MAX:,})"
+                    )
+                running_total += rows
         
         apply_transpose = mats[0]._transpose
 

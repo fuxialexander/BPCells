@@ -808,18 +808,20 @@ def precalculate_insertion_counts(fragments: Union[str, List[str]], output_dir: 
     chrom_sizes = dict(i for i in chrom_sizes.items() if i[0] in chrom_order)
     chrom_sizes = dict(sorted(chrom_sizes.items(), key = lambda x: chrom_order.index(x[0])))
 
-    tmp = tempfile.TemporaryDirectory()
-    bpcells.cpp.precalculate_pseudobulk_coverage(
-        fragments_normalized,
-        output_dir,
-        tmp.name,
-        list(chrom_sizes.keys()),
-        list(chrom_sizes.values()),
-        cell_groups_array,
-        1,
-        threads,
-        group_names
-    )
+    # Use context manager to ensure temp directory stays alive during C++ execution
+    # and is properly cleaned up even if an exception occurs
+    with tempfile.TemporaryDirectory() as tmp_dir:
+        bpcells.cpp.precalculate_pseudobulk_coverage(
+            fragments_normalized,
+            output_dir,
+            tmp_dir,
+            list(chrom_sizes.keys()),
+            list(chrom_sizes.values()),
+            cell_groups_array,
+            1,
+            threads,
+            group_names
+        )
 
     # Filter library_size.json if we had filtered cells
     # The C++ code may write library sizes for all groups, but we only want filtered ones
@@ -1078,20 +1080,22 @@ def precalculate_insertion_counts_binned(
     chrom_bin_counts = {chr: (size + bin_size - 1) // bin_size for chr, size in chrom_sizes.items()}
     total_bins = sum(chrom_bin_counts.values())
     
-    tmp = tempfile.TemporaryDirectory()
-    
-    # Call C++ function with specified bin_size
-    bpcells.cpp.precalculate_pseudobulk_coverage(
-        fragments_normalized,
-        output_dir,
-        tmp.name,
-        list(chrom_sizes.keys()),
-        list(chrom_sizes.values()),
-        cell_groups_array,
-        bin_size,  # Use the specified bin_size instead of hardcoded 1
-        threads,
-        group_names
-    )
+    # Use context manager to ensure temp directory stays alive during C++ execution
+    # and is properly cleaned up even if an exception occurs
+    with tempfile.TemporaryDirectory() as tmp_dir:
+        # Call C++ function with specified bin_size
+        # Note: tmp_dir will be cleaned up automatically when this block exits
+        bpcells.cpp.precalculate_pseudobulk_coverage(
+            fragments_normalized,
+            output_dir,
+            tmp_dir,
+            list(chrom_sizes.keys()),
+            list(chrom_sizes.values()),
+            cell_groups_array,
+            bin_size,  # Use the specified bin_size instead of hardcoded 1
+            threads,
+            group_names
+        )
     
     # Save metadata about binning
     metadata = {
