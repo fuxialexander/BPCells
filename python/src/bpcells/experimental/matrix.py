@@ -89,7 +89,7 @@ class DirMatrix:
             return res
     
     @staticmethod
-    def calculate_safe_chunk_size(rows: int, max_chunk_size: int = 10000) -> int:
+    def calculate_safe_chunk_size(rows: int, max_chunk_size: int = 5000) -> int:
         """Calculate safe chunk size for column slicing to avoid uint32_t overflow.
         
         When loading large matrices with many rows, slicing too many columns at once
@@ -98,7 +98,7 @@ class DirMatrix:
         
         Args:
             rows: Number of rows in the matrix
-            max_chunk_size: Maximum desired chunk size (default: 10000).
+            max_chunk_size: Maximum desired chunk size (default: 5000).
                 The actual chunk size will be min(max_chunk_size, safe_limit).
         
         Returns:
