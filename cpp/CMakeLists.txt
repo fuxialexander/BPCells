@@ -6,6 +6,29 @@ find_package(ZLIB REQUIRED)
 find_package(Eigen3 REQUIRED NO_MODULE)
 find_package(HWY REQUIRED NO_MODULE)
 
+# Find htslib - try pkg-config first, then fall back to manual search
+find_package(PkgConfig QUIET)
+if(PkgConfig_FOUND)
+    pkg_check_modules(HTSlib htslib)
+endif()
+
+# If pkg-config didn't find it, try manual find
+if(NOT HTSlib_FOUND)
+    find_path(HTSlib_INCLUDE_DIRS htslib/sam.h
+        PATHS /usr/include /usr/local/include ${CMAKE_INSTALL_PREFIX}/include
+    )
+    find_library(HTSlib_LIBRARIES hts
+        PATHS /usr/lib /usr/local/lib ${CMAKE_INSTALL_PREFIX}/lib
+    )
+    if(HTSlib_INCLUDE_DIRS AND HTSlib_LIBRARIES)
+        set(HTSlib_FOUND TRUE)
+    endif()
+endif()
+
+if(NOT HTSlib_FOUND)
+    message(FATAL_ERROR "htslib not found. Please install libhts-dev or htslib")
+endif()
+
 option(TARGET_ARM "Whether to build SIMD tests for ARM architectures (rather than x86)")
 
 set(CMAKE_CXX_STANDARD 17)
@@ -118,6 +141,7 @@ target_include_directories(
 add_library(
     fragmentIterators
     ${SRC}/fragmentIterators/BedFragments.cpp
+    ${SRC}/fragmentIterators/BamFragments.cpp
     ${SRC}/fragmentIterators/CellSelect.cpp
     ${SRC}/fragmentIterators/ChrSelect.cpp
     ${SRC}/fragmentIterators/FragmentIterator.cpp
@@ -134,11 +158,13 @@ target_link_libraries(
     arrayIO
     simd_math
     ${ZLIB_LIBRARIES}
+    ${HTSlib_LIBRARIES}
 )
 target_include_directories(
     fragmentIterators 
     PUBLIC 
     ${ZLIB_INCLUDE_DIRS}
+    ${HTSlib_INCLUDE_DIRS}
     ${SRC_INCLUDE}
 )
 

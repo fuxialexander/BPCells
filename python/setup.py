@@ -45,7 +45,7 @@ else:
 # Plan: take an environment variable for the libs
 # - HWY_INCLUDE_DIR: Include path for hwy library
 # - HWY_LIB_DIR: Lib path for hwy library
-libraries = ["hdf5", "hwy"]
+libraries = ["hdf5", "hwy", "hts"]
 include_dirs = ["src/bpcells-cpp", "src/vendor"]
 library_dirs = []
 

@@ -51,6 +51,20 @@ void precalculate_pseudobulk_coverage(
     std::optional<std::vector<std::string>> group_names = std::nullopt
 );
 
+// Calculate pseudobulk coverage directly from BAM file
+void precalculate_pseudobulk_coverage_bam(
+    std::string bam_path,
+    std::string output_path,
+    std::string tmp_path,
+    std::vector<std::string> chr,
+    std::vector<uint32_t> chr_len,
+    std::vector<int32_t> cell_groups,
+    int shift_start,
+    int shift_end,
+    int bin_size,
+    int threads,
+    std::optional<std::vector<std::string>> group_names = std::nullopt
+);
 
 Eigen::MatrixXi query_precalculated_pseudobulk_coverage(
     std::string mat_path,
