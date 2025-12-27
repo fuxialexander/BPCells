@@ -60,6 +60,49 @@ Eigen::MatrixXi query_precalculated_pseudobulk_coverage(
 
 // Template helper for parallel execution of tasks
 template <typename T>
-void parallel_map_helper(std::vector<std::future<T>> &futures, size_t threads, std::vector<T> *results = nullptr);
+void parallel_map_helper(std::vector<std::future<T>> &futures, size_t threads, std::vector<T> *results = nullptr) {
+    // Non-threaded fallback
+    if (threads == 0) {
+        for (size_t i = 0; i < futures.size(); i++) {
+            if (results) {
+                (*results)[i] = futures[i].get();
+            } else {
+                futures[i].get();
+            }
+        }
+        return;
+    }
+
+    // Very basic threading, designed for small numbers of futures
+    std::atomic<size_t> task_id(0);
+    std::atomic<bool> has_error = false;
+    std::exception_ptr exception;
+    std::vector<std::thread> thread_vec;
+    for (size_t i = 0; i < threads; i++) {
+        thread_vec.push_back(std::thread([&futures, &task_id, &has_error, &exception, results] {
+            while (true) {
+                size_t cur_task = task_id.fetch_add(1);
+                if (cur_task >= futures.size()) break;
+                try {
+                    if (results) {
+                        (*results)[cur_task] = futures[cur_task].get();
+                    } else {
+                        futures[cur_task].get();
+                    }
+                } catch (...) {
+                    has_error = true;
+                    exception = std::current_exception();
+                    break;
+                }
+            }
+        }));
+    }
+    for (auto &t : thread_vec) {
+        t.join();
+    }
+    if (has_error) {
+        std::rethrow_exception(exception);
+    }
+}
 
 } // namespace BPCells::py
