@@ -37,7 +37,7 @@ def precalculate_insertion_counts_bam(
     shift_start: int = 4,
     shift_end: int = -5,
     threads: int = 0,
-    group_names: Optional[List[str]] = None
+    group_names: Optional[Union[List[str], Dict[str, str]]] = None
 ) -> PrecalculatedInsertionMatrix:
     """Precalculate per-base insertion counts directly from BAM file.
 
@@ -76,11 +76,12 @@ def precalculate_insertion_counts_bam(
             - library_size.json: Library sizes per group
             - attrs.json: Metadata (store_type, source, etc.)
         cell_groups: Dictionary mapping cell barcode (CB tag value) to group ID.
-            For bulk data without CB tags, use {"bulk": 0}.
+            For bulk data without CB tags, use {"bulk.FILE_PREFIX": 0} where
+            FILE_PREFIX is derived from the BAM filename.
             Example for single-cell::
                 {"AAACCCAAGAAACCAT-1": 0, "AAACCCAAGAAACCAT-2": 1, ...}
             Example for bulk::
-                {"bulk": 0}
+                {"bulk.sample1": 0}
         chrom_sizes: Chromosome sizes. Can be:
             - Path to UCSC-style chrom.sizes file (tab-separated: chr<tab>size)
             - Dictionary mapping chromosome names to sizes: {"chr1": 248956422, ...}
@@ -156,6 +157,14 @@ def precalculate_insertion_counts_bam(
         chrom_sizes = pd.read_csv(chrom_sizes, sep="\t", names=["chrom", "size"])
         chrom_sizes = {t.chrom: t.size for t in chrom_sizes.itertuples()}
     
+    # Extract file prefix for bulk barcode naming
+    bam_basename = os.path.splitext(os.path.basename(bam_path))[0]
+    # Remove common suffixes like .sorted, .dedup, etc.
+    for suffix in ['.sorted', '.dedup', '.filtered', '.bam']:
+        if bam_basename.endswith(suffix):
+            bam_basename = bam_basename[:-len(suffix)]
+    bulk_barcode = f"bulk.{bam_basename}"
+    
     # Read BAM to discover cell order (we need this to create the cell_groups array)
     import pysam
     
@@ -182,9 +191,9 @@ def precalculate_insertion_counts_bam(
             bam = pysam.AlignmentFile(bam_path, "rb")
             
             if not has_cb_tags:
-                # No CB tags - use dummy "bulk" barcode for bulk data
-                cell_barcodes_ordered = ["bulk"]
-                cell_barcode_set = {"bulk"}
+                # No CB tags - use bulk.FILE_PREFIX barcode for bulk data
+                cell_barcodes_ordered = [bulk_barcode]
+                cell_barcode_set = {bulk_barcode}
             else:
                 # Read through entire BAM to discover all cell barcodes in order
                 for read in bam:
@@ -221,46 +230,63 @@ def precalculate_insertion_counts_bam(
     unique_group_ids = sorted(set(cell_groups.values()))
     
     # Determine group names:
-    # 1. Use provided group_names if available
-    # 2. Otherwise, try to derive from filename prefix
-    # 3. Fall back to numeric group IDs
-    if group_names is None:
-        # Try to derive group name from filename prefix
-        # Extract base filename without extension and path
-        bam_basename = os.path.splitext(os.path.basename(bam_path))[0]
-        # Remove common suffixes like .sorted, .dedup, etc.
-        for suffix in ['.sorted', '.dedup', '.filtered', '.bam']:
-            if bam_basename.endswith(suffix):
-                bam_basename = bam_basename[:-len(suffix)]
-        
-        # If we have only one group (common for bulk data), use filename prefix
-        if len(unique_group_ids) == 1:
-            group_names_list = [bam_basename]
-        else:
-            # Multiple groups - use filename prefix with group ID suffix
-            group_names_list = [f"{bam_basename}_group_{gid}" for gid in unique_group_ids]
-    else:
-        # Validate that group_names matches the number of unique groups
+    # 1. If group_names is a dict: map barcodes to group names
+    # 2. If group_names is a list: use as-is (one per unique group ID)
+    # 3. Otherwise: use barcode names as group names (default)
+    if isinstance(group_names, dict):
+        # Dict mapping barcodes to group names: {'bulk.FILE_PREFIX': 'GROUP_NAME'}
+        # Map each unique group ID to its group name
+        group_names_list = []
+        for gid in unique_group_ids:
+            # Find a barcode that maps to this group ID
+            group_name = None
+            for barcode, bgid in cell_groups.items():
+                if bgid == gid:
+                    # Use mapping if provided, otherwise use barcode itself
+                    group_name = group_names.get(barcode, barcode)
+                    break
+            if group_name is None:
+                # Fallback: use group ID as string
+                group_name = str(gid)
+            group_names_list.append(group_name)
+    elif isinstance(group_names, list):
+        # List of group names: validate length matches unique groups
         if len(group_names) != len(unique_group_ids):
             warnings.warn(
                 f"group_names length ({len(group_names)}) does not match number of unique groups "
-                f"({len(unique_group_ids)}). Using filename prefix instead.",
+                f"({len(unique_group_ids)}). Using barcode names instead.",
                 UserWarning,
                 stacklevel=2
             )
-            # Fall back to filename-based naming
-            bam_basename = os.path.splitext(os.path.basename(bam_path))[0]
-            for suffix in ['.sorted', '.dedup', '.filtered', '.bam']:
-                if bam_basename.endswith(suffix):
-                    bam_basename = bam_basename[:-len(suffix)]
-            if len(unique_group_ids) == 1:
-                group_names_list = [bam_basename]
-            else:
-                group_names_list = [f"{bam_basename}_group_{gid}" for gid in unique_group_ids]
+            # Fall back to barcode-based naming
+            group_names_list = []
+            for gid in unique_group_ids:
+                # Find a barcode that maps to this group ID
+                group_name = None
+                for barcode, bgid in cell_groups.items():
+                    if bgid == gid:
+                        group_name = barcode
+                        break
+                if group_name is None:
+                    group_name = str(gid)
+                group_names_list.append(group_name)
         else:
             # Map group_names to group IDs in sorted order
             group_id_to_idx = {gid: i for i, gid in enumerate(unique_group_ids)}
             group_names_list = [group_names[group_id_to_idx[gid]] for gid in unique_group_ids]
+    else:
+        # No group_names provided: use barcode names as group names
+        group_names_list = []
+        for gid in unique_group_ids:
+            # Find a barcode that maps to this group ID (use first one found)
+            group_name = None
+            for barcode, bgid in cell_groups.items():
+                if bgid == gid:
+                    group_name = barcode
+                    break
+            if group_name is None:
+                group_name = str(gid)
+            group_names_list.append(group_name)
     
     # Ensure output directory doesn't exist (C++ will create it)
     if os.path.exists(output_dir):
@@ -319,6 +345,226 @@ def precalculate_insertion_counts_bam(
         "shift_start": shift_start,
         "shift_end": shift_end,
         "group_names": group_names_list,  # Store group names for reference
+    }
+    attrs_path = os.path.join(output_dir, "attrs.json")
+    with open(attrs_path, "w") as f:
+        json.dump(attrs, f, indent=2)
+    
+    return PrecalculatedInsertionMatrix(output_dir)
+
+
+def precalculate_insertion_counts_bam_multi(
+    bam_files: List[str],
+    output_dir: str,
+    chrom_sizes: Union[str, Dict[str, int]],
+    shift_start: int = 4,
+    shift_end: int = -5,
+    threads: int = 0,
+    group_names: Optional[Union[List[str], Dict[str, str]]] = None
+) -> PrecalculatedInsertionMatrix:
+    """Precalculate per-base insertion counts from multiple BAM files in one call.
+
+    This function processes multiple bulk BAM files (without CB tags) directly to BPCells
+    celltype_dense format in a single matrix. Each BAM file gets a unique cell prefix
+    (e.g., "bulk.FILENAME") to distinguish cells, allowing all BAMs to be processed together.
+
+    Args:
+        bam_files: List of paths to BAM files (must be coordinate-sorted)
+        output_dir: Directory path where the insertion count matrix will be saved
+        chrom_sizes: Chromosome sizes (dict or path to chrom.sizes file)
+        shift_start: Basepairs to add to fragment start coordinates (default: 4)
+        shift_end: Basepairs to add to fragment end coordinates (default: -5)
+        threads: Number of parallel threads (0 = use all available CPUs)
+        group_names: Optional list of group names, one per BAM file
+
+    Returns:
+        PrecalculatedInsertionMatrix: A matrix object with one row per BAM file
+
+    Example:
+        >>> matrix = precalculate_insertion_counts_bam_multi(
+        ...     bam_files=["sample1.bam", "sample2.bam", "sample3.bam"],
+        ...     output_dir="output",
+        ...     chrom_sizes={"chr1": 248956422, "chr2": 242193529},
+        ...     group_names=["Sample1", "Sample2", "Sample3"]  # Optional
+        ... )
+    """
+    if not bam_files:
+        raise ValueError("At least one BAM file required")
+    
+    # Normalize BAM paths
+    bam_paths = [os.path.abspath(os.path.expanduser(bam_file)) for bam_file in bam_files]
+    
+    # Parse chrom_sizes
+    if isinstance(chrom_sizes, str):
+        chrom_sizes = pd.read_csv(chrom_sizes, sep="\t", names=["chrom", "size"])
+        chrom_sizes = {t.chrom: t.size for t in chrom_sizes.itertuples()}
+    
+    # Extract file prefixes for cell prefixes
+    bam_prefixes = []
+    for bam_path in bam_paths:
+        bam_basename = os.path.splitext(os.path.basename(bam_path))[0]
+        # Remove common suffixes
+        for suffix in ['.sorted', '.dedup', '.filtered', '.bam']:
+            if bam_basename.endswith(suffix):
+                bam_basename = bam_basename[:-len(suffix)]
+        bam_prefixes.append(f"bulk.{bam_basename}")
+    
+    # Discover cells from all BAM files with prefixes
+    import pysam
+    
+    all_cell_barcodes_ordered = []
+    all_cell_barcode_set = set()
+    bam_chr_names = None
+    
+    try:
+        # Use first BAM to get chromosome names
+        with pysam.AlignmentFile(bam_paths[0], "rb") as bam:
+            bam_chr_names = list(bam.references)
+        
+        # Discover cells from each BAM file
+        for bam_idx, bam_path in enumerate(bam_paths):
+            prefix = bam_prefixes[bam_idx]
+            
+            with pysam.AlignmentFile(bam_path, "rb") as bam:
+                # Check if CB tags exist
+                has_cb_tags = False
+                sample_count = 0
+                for read in bam:
+                    if read.is_proper_pair and read.is_read1 and not read.is_unmapped:
+                        if read.has_tag("CB"):
+                            has_cb_tags = True
+                            break
+                        sample_count += 1
+                        if sample_count >= 10000:
+                            break
+                
+                # Reset and discover cells
+                bam.close()
+                bam = pysam.AlignmentFile(bam_path, "rb")
+                
+                if not has_cb_tags:
+                    # No CB tags - use prefixed "bulk.FILENAME" barcode
+                    prefixed_barcode = prefix
+                    if prefixed_barcode not in all_cell_barcode_set:
+                        all_cell_barcodes_ordered.append(prefixed_barcode)
+                        all_cell_barcode_set.add(prefixed_barcode)
+                else:
+                    # Has CB tags - prefix each barcode
+                    for read in bam:
+                        if read.is_proper_pair and read.is_read1 and not read.is_unmapped:
+                            if read.has_tag("CB"):
+                                cb_tag = read.get_tag("CB")
+                                if cb_tag:
+                                    prefixed_barcode = f"{prefix}.{cb_tag}"
+                                    if prefixed_barcode not in all_cell_barcode_set:
+                                        all_cell_barcodes_ordered.append(prefixed_barcode)
+                                        all_cell_barcode_set.add(prefixed_barcode)
+    except ImportError:
+        raise ImportError("pysam is required for precalculate_insertion_counts_bam_multi. Install with: pip install pysam")
+    except Exception as e:
+        raise RuntimeError(f"Error reading BAM files: {e}")
+    
+    # Create cell_groups dict: each BAM file gets its own group (group ID = BAM index)
+    cell_groups = {}
+    for i, barcode in enumerate(all_cell_barcodes_ordered):
+        # Determine which BAM this barcode belongs to based on prefix
+        for bam_idx, prefix in enumerate(bam_prefixes):
+            if barcode.startswith(prefix):
+                cell_groups[barcode] = bam_idx
+                break
+        else:
+            # Fallback: assign to group 0
+            cell_groups[barcode] = 0
+    
+    # Create cell_groups array in discovered order
+    cell_groups_array = np.array([cell_groups.get(barcode, 0) for barcode in all_cell_barcodes_ordered], dtype=np.int32)
+    
+    # Re-order chrom_sizes to match BAM chromosome order
+    chrom_sizes = dict(i for i in chrom_sizes.items() if i[0] in bam_chr_names)
+    chrom_sizes = dict(sorted(chrom_sizes.items(), key=lambda x: bam_chr_names.index(x[0]) if x[0] in bam_chr_names else len(bam_chr_names)))
+    
+    # Determine group names
+    unique_group_ids = sorted(set(cell_groups_array.tolist()))
+    
+    # Determine group names:
+    # 1. If group_names is a dict: map barcodes (bulk.FILE_PREFIX) to group names
+    # 2. If group_names is a list: use as-is (one per BAM file/group ID)
+    # 3. Otherwise: use barcode prefixes as group names (default)
+    if isinstance(group_names, dict):
+        # Dict mapping barcodes to group names: {'bulk.FILE_PREFIX': 'GROUP_NAME'}
+        group_names_list = []
+        for gid in unique_group_ids:
+            # Find the barcode prefix for this group ID (should be bam_prefixes[gid])
+            if gid < len(bam_prefixes):
+                barcode_prefix = bam_prefixes[gid]
+                # Use mapping if provided, otherwise use barcode prefix itself
+                group_name = group_names.get(barcode_prefix, barcode_prefix)
+            else:
+                group_name = str(gid)
+            group_names_list.append(group_name)
+    elif isinstance(group_names, list):
+        # List of group names: validate length matches number of BAM files
+        if len(group_names) != len(bam_files):
+            warnings.warn(
+                f"group_names length ({len(group_names)}) does not match number of BAM files "
+                f"({len(bam_files)}). Using barcode prefixes instead.",
+                UserWarning,
+                stacklevel=2
+            )
+            group_names_list = [bam_prefixes[i] for i in unique_group_ids]
+        else:
+            # Map group_names to group IDs
+            group_id_to_idx = {gid: i for i, gid in enumerate(unique_group_ids)}
+            group_names_list = [group_names[group_id_to_idx[gid]] for gid in unique_group_ids]
+    else:
+        # No group_names provided: use barcode prefixes as group names
+        group_names_list = [bam_prefixes[i] for i in unique_group_ids]
+    
+    # Ensure output directory doesn't exist
+    if os.path.exists(output_dir):
+        shutil.rmtree(output_dir)
+    
+    # Check if C++ function supports multi-BAM (will be added)
+    # For now, we'll need to use the single-BAM approach with MergeFragments
+    # This requires implementing the multi-BAM C++ function first
+    
+    # Use context manager to ensure temp directory stays alive during C++ execution
+    with tempfile.TemporaryDirectory() as tmp_dir:
+        # Call C++ multi-BAM function
+        bpcells.cpp.precalculate_pseudobulk_coverage_bam_multi(
+            bam_paths,
+            bam_prefixes,
+            output_dir,
+            tmp_dir,
+            list(chrom_sizes.keys()),
+            list(chrom_sizes.values()),
+            cell_groups_array.tolist(),
+            shift_start,
+            shift_end,
+            1,  # bin_size hardcoded to 1 for insertion counts
+            threads,
+            group_names_list  # Pass group names to C++ for row names
+        )
+    
+    # Save chrom_offsets
+    chrom_offsets = dict(zip(chrom_sizes.keys(), [0] + np.cumsum(list(chrom_sizes.values()))[:-1].tolist()))
+    json.dump(chrom_offsets, open(f"{output_dir}/chrom_offsets.json", "w"), indent=2)
+    
+    # Save group_names.json for CelltypeDenseBPCellsIO compatibility
+    group_names_path = os.path.join(output_dir, "group_names.json")
+    with open(group_names_path, "w") as f:
+        json.dump(group_names_list, f, indent=2)
+    
+    # Save attrs.json with metadata for Caesar compatibility
+    attrs = {
+        "assembly": None,
+        "store_type": "bpcells_celltype_dense",
+        "class": "CelltypeDenseBPCellsIO",
+        "source": "bam_files_multi",
+        "bam_files": bam_paths,
+        "shift_start": shift_start,
+        "shift_end": shift_end,
+        "group_names": group_names_list,
     }
     attrs_path = os.path.join(output_dir, "attrs.json")
     with open(attrs_path, "w") as f:

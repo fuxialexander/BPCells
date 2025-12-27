@@ -15,6 +15,7 @@
 
 #include "py_interrupts.hpp"
 #include "fragments.hpp"
+#include "bam.hpp"
 #include "matrix.hpp"
 
 #include "bpcells-cpp/arrayIO/vector.h"
@@ -41,6 +42,12 @@ PYBIND11_MODULE(cpp, m) {
           pybind11::arg("group_names") = nullptr);
     m.def("precalculate_pseudobulk_coverage_bam", &BPCells::py::precalculate_pseudobulk_coverage_bam,
           pybind11::arg("bam_path"), pybind11::arg("output_path"), 
+          pybind11::arg("tmp_path"), pybind11::arg("chr"), pybind11::arg("chr_len"), 
+          pybind11::arg("cell_groups"), pybind11::arg("shift_start"), pybind11::arg("shift_end"),
+          pybind11::arg("bin_size"), pybind11::arg("threads"),
+          pybind11::arg("group_names") = pybind11::none());
+    m.def("precalculate_pseudobulk_coverage_bam_multi", &BPCells::py::precalculate_pseudobulk_coverage_bam_multi,
+          pybind11::arg("bam_paths"), pybind11::arg("bam_prefixes"), pybind11::arg("output_path"), 
           pybind11::arg("tmp_path"), pybind11::arg("chr"), pybind11::arg("chr_len"), 
           pybind11::arg("cell_groups"), pybind11::arg("shift_start"), pybind11::arg("shift_end"),
           pybind11::arg("bin_size"), pybind11::arg("threads"),
