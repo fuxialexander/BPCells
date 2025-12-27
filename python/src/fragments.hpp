@@ -8,8 +8,12 @@
 
 #pragma once
 
+#include <atomic>
+#include <exception>
+#include <future>
 #include <optional>
 #include <string>
+#include <thread>
 #include <vector>
 
 #include <Eigen/Core>
