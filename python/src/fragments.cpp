@@ -797,4 +797,3 @@ Eigen::MatrixXi query_precalculated_pseudobulk_coverage(
 }
 
 } // namespace BPCells::py
-} // namespace BPCells::py

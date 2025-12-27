@@ -58,4 +58,8 @@ Eigen::MatrixXi query_precalculated_pseudobulk_coverage(
     uint32_t range_len
 );
 
+// Template helper for parallel execution of tasks
+template <typename T>
+void parallel_map_helper(std::vector<std::future<T>> &futures, size_t threads, std::vector<T> *results = nullptr);
+
 } // namespace BPCells::py
