@@ -40,18 +40,24 @@ PYBIND11_MODULE(cpp, m) {
           pybind11::arg("tmp_path"), pybind11::arg("chr"), pybind11::arg("chr_size"), 
           pybind11::arg("cell_groups"), pybind11::arg("bin_size"), pybind11::arg("threads"),
           pybind11::arg("group_names") = nullptr);
-    m.def("precalculate_pseudobulk_coverage_bam", &BPCells::py::precalculate_pseudobulk_coverage_bam,
-          pybind11::arg("bam_path"), pybind11::arg("output_path"), 
-          pybind11::arg("tmp_path"), pybind11::arg("chr"), pybind11::arg("chr_len"), 
-          pybind11::arg("cell_groups"), pybind11::arg("shift_start"), pybind11::arg("shift_end"),
-          pybind11::arg("bin_size"), pybind11::arg("threads"),
-          pybind11::arg("group_names") = pybind11::none());
-    m.def("precalculate_pseudobulk_coverage_bam_multi", &BPCells::py::precalculate_pseudobulk_coverage_bam_multi,
-          pybind11::arg("bam_paths"), pybind11::arg("bam_prefixes"), pybind11::arg("output_path"), 
-          pybind11::arg("tmp_path"), pybind11::arg("chr"), pybind11::arg("chr_len"), 
-          pybind11::arg("cell_groups"), pybind11::arg("shift_start"), pybind11::arg("shift_end"),
-          pybind11::arg("bin_size"), pybind11::arg("threads"),
-          pybind11::arg("group_names") = pybind11::none());
+           m.def("bam_has_cb_tags", &BPCells::py::bam_has_cb_tags,
+                 pybind11::arg("bam_path"), pybind11::arg("barcode_tag") = "CB", pybind11::arg("sample_size") = 10000);
+           m.def("discover_cells_from_bam", &BPCells::py::discover_cells_from_bam,
+                 pybind11::arg("bam_path"), pybind11::arg("barcode_tag") = "CB", pybind11::arg("cell_prefix") = "");
+           m.def("discover_cells_from_bam_multi", &BPCells::py::discover_cells_from_bam_multi,
+                 pybind11::arg("bam_paths"), pybind11::arg("bam_prefixes"), pybind11::arg("barcode_tag") = "CB");
+           m.def("precalculate_pseudobulk_coverage_bam", &BPCells::py::precalculate_pseudobulk_coverage_bam,
+                 pybind11::arg("bam_path"), pybind11::arg("output_path"),
+                 pybind11::arg("tmp_path"), pybind11::arg("chr"), pybind11::arg("chr_len"),
+                 pybind11::arg("cell_groups"), pybind11::arg("shift_start"), pybind11::arg("shift_end"),
+                 pybind11::arg("bin_size"), pybind11::arg("threads"),
+                 pybind11::arg("group_names") = pybind11::none());
+           m.def("precalculate_pseudobulk_coverage_bam_multi", &BPCells::py::precalculate_pseudobulk_coverage_bam_multi,
+                 pybind11::arg("bam_paths"), pybind11::arg("bam_prefixes"), pybind11::arg("output_path"),
+                 pybind11::arg("tmp_path"), pybind11::arg("chr"), pybind11::arg("chr_len"),
+                 pybind11::arg("cell_groups"), pybind11::arg("shift_start"), pybind11::arg("shift_end"),
+                 pybind11::arg("bin_size"), pybind11::arg("threads"),
+                 pybind11::arg("group_names") = pybind11::none());
     m.def("query_precalculated_pseudobulk_coverage", &BPCells::py::query_precalculated_pseudobulk_coverage);
         
     m.def("write_matrix_dir_from_memory", &BPCells::py::write_matrix_dir_from_memory);

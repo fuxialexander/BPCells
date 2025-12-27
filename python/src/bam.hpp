@@ -15,6 +15,25 @@
 
 namespace BPCells::py {
 
+// Quick check if BAM file has CB tags (samples first N reads)
+// Returns true if CB tags found, false otherwise
+bool bam_has_cb_tags(std::string bam_path, std::string barcode_tag = "CB", uint32_t sample_size = 10000);
+
+// Discover all cells from BAM file (full scan)
+// Returns vector of cell names in discovery order
+std::vector<std::string> discover_cells_from_bam(
+    std::string bam_path,
+    std::string barcode_tag = "CB",
+    std::string cell_prefix = ""
+);
+
+// Discover all cells from multiple BAM files
+std::vector<std::string> discover_cells_from_bam_multi(
+    std::vector<std::string> bam_paths,
+    std::vector<std::string> bam_prefixes,
+    std::string barcode_tag = "CB"
+);
+
 // Calculate pseudobulk coverage directly from BAM file
 void precalculate_pseudobulk_coverage_bam(
     std::string bam_path,

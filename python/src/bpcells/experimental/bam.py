@@ -165,46 +165,70 @@ def precalculate_insertion_counts_bam(
             bam_basename = bam_basename[:-len(suffix)]
     bulk_barcode = f"bulk.{bam_basename}"
     
-    # Read BAM to discover cell order (we need this to create the cell_groups array)
-    import pysam
-    
-    cell_barcodes_ordered = []
-    cell_barcode_set = set()
+    # OPTIMIZATION: Quick check if CB tags exist using C++ (faster than pysam)
+    # If no CB tags, skip full scan and use bulk barcode directly
+    import bpcells.cpp as cpp
     
     try:
+        # Quick check using C++ (samples first 10k reads)
+        has_cb_tags = cpp.bam_has_cb_tags(bam_path, "CB", 10000)
+        
+        # Get chromosome names quickly (just header read, very fast)
+        import pysam
         with pysam.AlignmentFile(bam_path, "rb") as bam:
             bam_chr_names = list(bam.references)
-            # Check first few reads to see if CB tags exist
-            has_cb_tags = False
-            sample_count = 0
-            for read in bam:
-                if read.is_proper_pair and read.is_read1 and not read.is_unmapped:
-                    if read.has_tag("CB"):
-                        has_cb_tags = True
-                        break
-                    sample_count += 1
-                    if sample_count >= 10000:  # Sample first 10k reads to check
-                        break
-            
-            # Reset file pointer and read through entire file to discover all cells
-            bam.close()
-            bam = pysam.AlignmentFile(bam_path, "rb")
-            
-            if not has_cb_tags:
-                # No CB tags - use bulk.FILE_PREFIX barcode for bulk data
-                cell_barcodes_ordered = [bulk_barcode]
-                cell_barcode_set = {bulk_barcode}
-            else:
-                # Read through entire BAM to discover all cell barcodes in order
+        
+        if not has_cb_tags:
+            # No CB tags - use bulk.FILE_PREFIX barcode for bulk data
+            # Skip full scan - this saves significant time for bulk data
+            cell_barcodes_ordered = [bulk_barcode]
+            cell_barcode_set = {bulk_barcode}
+        else:
+            # Single-cell data - need to discover all cells
+            # Use C++ for discovery (faster than pysam)
+            cell_barcodes_ordered = cpp.discover_cells_from_bam(bam_path, "CB", "")
+            cell_barcode_set = set(cell_barcodes_ordered)
+    except ImportError:
+        # Fallback to pysam if C++ functions not available
+        import pysam
+        try:
+            with pysam.AlignmentFile(bam_path, "rb") as bam:
+                bam_chr_names = list(bam.references)
+                # Check first few reads to see if CB tags exist
+                has_cb_tags = False
+                sample_count = 0
                 for read in bam:
                     if read.is_proper_pair and read.is_read1 and not read.is_unmapped:
                         if read.has_tag("CB"):
-                            cb_tag = read.get_tag("CB")
-                            if cb_tag and cb_tag not in cell_barcode_set:
-                                cell_barcodes_ordered.append(cb_tag)
-                                cell_barcode_set.add(cb_tag)
-    except ImportError:
-        raise ImportError("pysam is required for precalculate_insertion_counts_bam. Install with: pip install pysam")
+                            has_cb_tags = True
+                            break
+                        sample_count += 1
+                        if sample_count >= 10000:  # Sample first 10k reads to check
+                            break
+                
+                # Reset file pointer
+                bam.close()
+                bam = pysam.AlignmentFile(bam_path, "rb")
+                
+                if not has_cb_tags:
+                    # No CB tags - use bulk.FILE_PREFIX barcode for bulk data
+                    cell_barcodes_ordered = [bulk_barcode]
+                    cell_barcode_set = {bulk_barcode}
+                else:
+                    # Read through entire BAM to discover all cell barcodes in order
+                    cell_barcodes_ordered = []
+                    cell_barcode_set = set()
+                    for read in bam:
+                        if read.is_proper_pair and read.is_read1 and not read.is_unmapped:
+                            if read.has_tag("CB"):
+                                cb_tag = read.get_tag("CB")
+                                if cb_tag and cb_tag not in cell_barcode_set:
+                                    cell_barcodes_ordered.append(cb_tag)
+                                    cell_barcode_set.add(cb_tag)
+        except ImportError:
+            raise ImportError("pysam is required for precalculate_insertion_counts_bam. Install with: pip install pysam")
+        except Exception as e:
+            raise RuntimeError(f"Error reading BAM file: {e}")
     except Exception as e:
         raise RuntimeError(f"Error reading BAM file: {e}")
     

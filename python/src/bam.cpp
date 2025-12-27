@@ -36,8 +36,137 @@
 
 namespace BPCells::py {
 
+// Quick check if BAM file has CB tags (samples first N reads)
+bool bam_has_cb_tags(std::string bam_path, std::string barcode_tag, uint32_t sample_size) {
+    samFile *fp = sam_open(bam_path.c_str(), "r");
+    if (fp == nullptr) {
+        throw std::runtime_error("Failed to open BAM file: " + bam_path);
+    }
+    
+    bam_hdr_t *header = sam_hdr_read(fp);
+    if (header == nullptr) {
+        sam_close(fp);
+        throw std::runtime_error("Failed to read BAM header: " + bam_path);
+    }
+    
+    bam1_t *b = bam_init1();
+    if (b == nullptr) {
+        bam_hdr_destroy(header);
+        sam_close(fp);
+        throw std::runtime_error("Failed to allocate bam1_t structure");
+    }
+    
+    uint32_t checked = 0;
+    bool has_cb = false;
+    
+    while (sam_read1(fp, header, b) >= 0 && checked < sample_size) {
+        if (b->core.flag & BAM_FPROPER_PAIR && 
+            b->core.flag & BAM_FREAD1 && 
+            !(b->core.flag & BAM_FUNMAP)) {
+            uint8_t *tag_data = bam_aux_get(b, barcode_tag.c_str());
+            if (tag_data != nullptr) {
+                has_cb = true;
+                break;
+            }
+            checked++;
+        }
+    }
+    
+    bam_destroy1(b);
+    bam_hdr_destroy(header);
+    sam_close(fp);
+    
+    return has_cb;
+}
+
+// Discover all cells from BAM file (full scan)
+std::vector<std::string> discover_cells_from_bam(
+    std::string bam_path,
+    std::string barcode_tag,
+    std::string cell_prefix
+) {
+    std::unique_ptr<FragmentLoader> frags = std::make_unique<BamFragments>(bam_path, barcode_tag, cell_prefix);
+    
+    // Scan through entire file to discover all cells
+    frags->restart();
+    while (frags->nextChr()) {
+        while (frags->load()) {
+            // Just load to discover cells, don't need to process data
+        }
+    }
+    
+    // Extract cell names
+    std::vector<std::string> cell_names;
+    int cell_count = frags->cellCount();
+    for (int i = 0; i < cell_count; i++) {
+        const char *name = frags->cellNames(i);
+        if (name != nullptr) {
+            cell_names.push_back(std::string(name));
+        }
+    }
+    
+    return cell_names;
+}
+
+// Discover all cells from multiple BAM files
+std::vector<std::string> discover_cells_from_bam_multi(
+    std::vector<std::string> bam_paths,
+    std::vector<std::string> bam_prefixes,
+    std::string barcode_tag
+) {
+    std::vector<std::unique_ptr<FragmentLoader>> frag_loaders;
+    for (size_t i = 0; i < bam_paths.size(); i++) {
+        std::string prefix = (i < bam_prefixes.size()) ? bam_prefixes[i] : "";
+        frag_loaders.push_back(
+            std::make_unique<BamFragments>(bam_paths[i], barcode_tag, prefix)
+        );
+    }
+    
+    // Get chromosome names from first BAM
+    std::vector<std::string> chr_levels;
+    if (!frag_loaders.empty()) {
+        int chr_count = frag_loaders[0]->chrCount();
+        for (int i = 0; i < chr_count; i++) {
+            const char *chr_name = frag_loaders[0]->chrNames(i);
+            if (chr_name != nullptr) {
+                chr_levels.push_back(std::string(chr_name));
+            }
+        }
+    }
+    
+    // Merge fragments
+    std::unique_ptr<FragmentLoader> frags;
+    if (frag_loaders.size() == 1) {
+        frags = std::move(frag_loaders[0]);
+    } else {
+        frags = std::make_unique<MergeFragments>(std::move(frag_loaders), chr_levels);
+    }
+    
+    // Scan through entire file to discover all cells
+    frags->restart();
+    while (frags->nextChr()) {
+        while (frags->load()) {
+            // Just load to discover cells, don't need to process data
+        }
+    }
+    
+    // Extract cell names
+    std::vector<std::string> cell_names;
+    int cell_count = frags->cellCount();
+    for (int i = 0; i < cell_count; i++) {
+        const char *name = frags->cellNames(i);
+        if (name != nullptr) {
+            cell_names.push_back(std::string(name));
+        }
+    }
+    
+    return cell_names;
+}
+
 // Write a chunk of the tile matrix columns to the given output path (BAM version)
 // This helper MUST instantiate BamFragments locally inside the thread for thread safety
+// OPTIMIZED: Accepts expected_cell_count to skip redundant pre-scan (if > 0)
+// OPTIMIZED: Reuses fragment loader to avoid double loading
 static std::vector<uint64_t> precalculate_pseudobulk_coverage_bam_helper(
     std::string bam_path,
     std::string chunk_output_path,
@@ -55,23 +184,28 @@ static std::vector<uint64_t> precalculate_pseudobulk_coverage_bam_helper(
     int bin_size,
     int shift_start,
     int shift_end,
+    int expected_cell_count,  // If > 0, skip pre-scan (cells already discovered)
 
     std::atomic<bool> *user_interrupt
 ) {
     // 1. Open BAM file locally (thread-safe - each thread gets its own handle)
     std::unique_ptr<FragmentLoader> frags = std::make_unique<BamFragments>(bam_path);
 
-    // 2. Pre-scan to discover all cells (needed for CellMerge validation)
-    // We need to read through the file once to discover all cells before creating CellMerge
-    // This ensures cellCount() returns the correct value
-    frags->restart();
-    while (frags->nextChr()) {
-        while (frags->load()) {
-            // Just load to discover cells, don't need to process data
+    // 2. Pre-scan to discover all cells ONLY if not already discovered
+    if (expected_cell_count <= 0) {
+        // Need to discover cells (shouldn't happen in optimized path, but keep for safety)
+        frags->restart();
+        while (frags->nextChr()) {
+            while (frags->load()) {
+                // Just load to discover cells, don't need to process data
+            }
         }
+        // Restart again for actual processing
+        frags->restart();
+    } else {
+        // Cells already discovered - just restart for processing
+        frags->restart();
     }
-    // Restart again for actual processing
-    frags->restart();
 
     // 3. Apply Tn5 Shift if needed
     if (shift_start != 0 || shift_end != 0) {
@@ -88,7 +222,7 @@ static std::vector<uint64_t> precalculate_pseudobulk_coverage_bam_helper(
         );
     }
 
-    // 5. Merge cells (now cellCount() will return the correct value)
+    // 5. Merge cells
     frags = std::make_unique<CellMerge>(
         std::move(frags), group_ids, std::make_unique<VecStringReader>(group_names)
     );
@@ -98,12 +232,12 @@ static std::vector<uint64_t> precalculate_pseudobulk_coverage_bam_helper(
         std::move(frags), chr_id, start, end, width, std::make_unique<VecStringReader>(chr_levels), false
     );
 
-    // 5. Subset to the desired columns
+    // 7. Subset to the desired columns
     tile_mat = std::make_unique<MatrixColSlice<uint32_t>>(
         std::move(tile_mat), chunk_col_range.first, chunk_col_range.second
     );
 
-    // 6. Track per-group sums in this chunk using efficient rowSums
+    // 8. Track per-group sums in this chunk using efficient rowSums
     std::vector<uint64_t> group_sums(group_names.size(), 0);
     
     // Use the efficient rowSums implementation from MatrixOps.h
@@ -114,8 +248,10 @@ static std::vector<uint64_t> precalculate_pseudobulk_coverage_bam_helper(
         group_sums[i] = static_cast<uint64_t>(row_sums[i]);
     }
 
-    // 7. Reload fragments for writing (need to recreate since we moved it)
+    // 9. Reload fragments for writing (rowSums consumed the iterator)
+    // OPTIMIZED: Skip pre-scan since we already know cell count
     std::unique_ptr<FragmentLoader> frags_new = std::make_unique<BamFragments>(bam_path);
+    frags_new->restart();  // Skip pre-scan - cells already discovered
     
     if (shift_start != 0 || shift_end != 0) {
         frags_new = std::make_unique<ShiftCoords>(std::move(frags_new), shift_start, shift_end);
@@ -126,8 +262,8 @@ static std::vector<uint64_t> precalculate_pseudobulk_coverage_bam_helper(
         group_ids,
         std::make_unique<VecStringReader>(group_names)
     );
-    
-    // 8. Properly construct TileMatrix
+
+    // 10. Construct TileMatrix for writing
     tile_mat = std::make_unique<TileMatrix>(
         std::move(merged_frags), 
         chr_id,
@@ -143,13 +279,13 @@ static std::vector<uint64_t> precalculate_pseudobulk_coverage_bam_helper(
         std::move(tile_mat), chunk_col_range.first, chunk_col_range.second
     );
 
-    // 9. Clear the row/col names
+    // 11. Clear the row/col names
     std::vector<std::string> empty;
     tile_mat = std::make_unique<RenameDims<uint32_t>>(
         std::move(tile_mat), empty, empty, true, true
     );
 
-    // 10. Write to output
+    // 12. Write to output
     // Use version 9999 (experimental) if bin_size == 1, otherwise use version 2 (standard)
     FileWriterBuilder wb(chunk_output_path);
     if (bin_size == 1) {
@@ -163,6 +299,8 @@ static std::vector<uint64_t> precalculate_pseudobulk_coverage_bam_helper(
 
 // Write a chunk of the tile matrix columns to the given output path (Multi-BAM version)
 // This helper MUST instantiate BamFragments locally inside the thread for thread safety
+// OPTIMIZED: Accepts expected_cell_count to skip redundant pre-scan (if > 0)
+// OPTIMIZED: Reuses fragment loader to avoid double loading
 static std::vector<uint64_t> precalculate_pseudobulk_coverage_bam_multi_helper(
     const std::vector<std::string> &bam_paths,
     const std::vector<std::string> &bam_prefixes,  // Cell prefixes for each BAM
@@ -181,6 +319,7 @@ static std::vector<uint64_t> precalculate_pseudobulk_coverage_bam_multi_helper(
     int bin_size,
     int shift_start,
     int shift_end,
+    int expected_cell_count,  // If > 0, skip pre-scan (cells already discovered)
 
     std::atomic<bool> *user_interrupt
 ) {
@@ -201,15 +340,21 @@ static std::vector<uint64_t> precalculate_pseudobulk_coverage_bam_multi_helper(
         frags = std::make_unique<MergeFragments>(std::move(frag_loaders), chr_levels);
     }
 
-    // 3. Pre-scan to discover all cells (needed for CellMerge validation)
-    frags->restart();
-    while (frags->nextChr()) {
-        while (frags->load()) {
-            // Just load to discover cells, don't need to process data
+    // 3. Pre-scan to discover all cells ONLY if not already discovered
+    if (expected_cell_count <= 0) {
+        // Need to discover cells (shouldn't happen in optimized path, but keep for safety)
+        frags->restart();
+        while (frags->nextChr()) {
+            while (frags->load()) {
+                // Just load to discover cells, don't need to process data
+            }
         }
+        // Restart again for actual processing
+        frags->restart();
+    } else {
+        // Cells already discovered - just restart for processing
+        frags->restart();
     }
-    // Restart again for actual processing
-    frags->restart();
 
     // 4. Apply Tn5 Shift if needed
     if (shift_start != 0 || shift_end != 0) {
@@ -252,13 +397,15 @@ static std::vector<uint64_t> precalculate_pseudobulk_coverage_bam_multi_helper(
         group_sums[i] = static_cast<uint64_t>(row_sums[i]);
     }
 
-    // 10. Reload fragments for writing (need to recreate since we moved it)
+    // 10. Reload fragments for writing (rowSums consumed the iterator)
+    // OPTIMIZED: Skip pre-scan since we already know cell count
     std::vector<std::unique_ptr<FragmentLoader>> frag_loaders_new;
     for (size_t i = 0; i < bam_paths.size(); i++) {
         std::string prefix = (i < bam_prefixes.size()) ? bam_prefixes[i] : "";
         frag_loaders_new.push_back(
             std::make_unique<BamFragments>(bam_paths[i], "CB", prefix)
         );
+        frag_loaders_new.back()->restart();  // Skip pre-scan - cells already discovered
     }
     
     std::unique_ptr<FragmentLoader> frags_new;
@@ -277,8 +424,8 @@ static std::vector<uint64_t> precalculate_pseudobulk_coverage_bam_multi_helper(
         group_ids,
         std::make_unique<VecStringReader>(group_names)
     );
-    
-    // 11. Properly construct TileMatrix
+
+    // 11. Construct TileMatrix for writing
     tile_mat = std::make_unique<TileMatrix>(
         std::move(merged_frags), 
         chr_id,
@@ -341,7 +488,7 @@ void precalculate_pseudobulk_coverage_bam(
     std::vector<uint32_t> chr_id;
     std::unordered_map<std::string, uint32_t> chr_name_lookup;
     std::vector<std::string> chr_levels;
-    
+
     int bam_chr_count = bam_frags.chrCount();
     for (int32_t i = 0; i < bam_chr_count; i++) {
         const char *chr_name = bam_frags.chrNames(i);
@@ -351,7 +498,7 @@ void precalculate_pseudobulk_coverage_bam(
         chr_name_lookup[std::string(chr_name)] = i;
         chr_levels.push_back(std::string(chr_name));
     }
-    
+
     for (auto &c : chr) {
         if (chr_name_lookup.find(c) == chr_name_lookup.end()) {
             throw std::runtime_error("precalculate_pseudobulk_coverage_bam: chromosome " + c + " not found in BAM");
@@ -383,6 +530,26 @@ void precalculate_pseudobulk_coverage_bam(
     std::vector<uint32_t> cell_groups_uint;
     for (const auto &x : cell_groups) {
         cell_groups_uint.push_back(x >= 0 ? x : num_groups);
+    }
+
+    // OPTIMIZATION: Discover cells once before chunking (instead of in each thread)
+    // Quick check if CB tags exist - if not, we know it's bulk data
+    bool has_cb = bam_has_cb_tags(bam_path, "CB", 10000);
+    int expected_cell_count = 0;
+    if (!has_cb) {
+        // Bulk data - we know there's exactly one cell (bulk.FILE_PREFIX)
+        expected_cell_count = 1;
+    } else {
+        // Single-cell data - need to discover all cells
+        std::vector<std::string> discovered_cells = discover_cells_from_bam(bam_path, "CB", "");
+        expected_cell_count = discovered_cells.size();
+        // Verify discovered cell count matches cell_groups size
+        if (expected_cell_count != (int)cell_groups_uint.size()) {
+            throw std::runtime_error(
+                "Cell count mismatch: discovered " + std::to_string(expected_cell_count) +
+                " cells in BAM, but cell_groups array has length " + std::to_string(cell_groups_uint.size())
+            );
+        }
     }
 
     // Split columns into chunks
@@ -424,7 +591,8 @@ void precalculate_pseudobulk_coverage_bam(
                                         chunks,
                                         bin_size,
                                         shift_start,
-                                        shift_end](std::atomic<bool> *user_interrupt) {
+                                        shift_end,
+                                        expected_cell_count](std::atomic<bool> *user_interrupt) {
         std::vector<std::future<std::vector<uint64_t>>> task_vec;
         all_group_sums.resize(chunks);
 
@@ -447,6 +615,7 @@ void precalculate_pseudobulk_coverage_bam(
                 bin_size,
                 shift_start,
                 shift_end,
+                expected_cell_count,  // Pass pre-discovered cell count
 
                 user_interrupt
             ));
@@ -635,6 +804,18 @@ void precalculate_pseudobulk_coverage_bam_multi(
         cell_groups_uint.push_back(x >= 0 ? x : num_groups);
     }
 
+    // OPTIMIZATION: Discover cells once before chunking (instead of in each thread)
+    // For multi-BAM, always discover all cells (could be bulk or single-cell)
+    std::vector<std::string> discovered_cells = discover_cells_from_bam_multi(bam_paths, bam_prefixes, "CB");
+    int expected_cell_count = discovered_cells.size();
+    // Verify discovered cell count matches cell_groups size
+    if (expected_cell_count != (int)cell_groups_uint.size()) {
+        throw std::runtime_error(
+            "Cell count mismatch: discovered " + std::to_string(expected_cell_count) +
+            " cells across all BAM files, but cell_groups array has length " + std::to_string(cell_groups_uint.size())
+        );
+    }
+
     // Split columns into chunks
     size_t total_columns = 0;
     for (const auto &x : chr_len) {
@@ -675,7 +856,8 @@ void precalculate_pseudobulk_coverage_bam_multi(
                                         chunks,
                                         bin_size,
                                         shift_start,
-                                        shift_end](std::atomic<bool> *user_interrupt) {
+                                        shift_end,
+                                        expected_cell_count](std::atomic<bool> *user_interrupt) {
         std::vector<std::future<std::vector<uint64_t>>> task_vec;
         all_group_sums.resize(chunks);
 
@@ -699,6 +881,7 @@ void precalculate_pseudobulk_coverage_bam_multi(
                 bin_size,
                 shift_start,
                 shift_end,
+                expected_cell_count,  // Pass pre-discovered cell count
 
                 user_interrupt
             ));
