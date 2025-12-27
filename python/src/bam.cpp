@@ -778,7 +778,7 @@ void precalculate_pseudobulk_coverage_bam_multi(
         std_fs::remove_all(std_fs::path(x));
     }
     
-    // Write library sizes to JSON format (as dict mapping group names to sizes)
+    // Write library sizes to JSON format (compatible with PrecalculatedInsertionMatrix)
     if (!std_fs::exists(std_fs::path(output_path))) {
         std_fs::create_directories(std_fs::path(output_path));
     }
@@ -789,16 +789,17 @@ void precalculate_pseudobulk_coverage_bam_multi(
         throw std::runtime_error("Could not open file for writing library sizes: " + library_size_path);
     }
     
-    // Write as dict mapping group names to library sizes
+    // Write in format expected by PrecalculatedInsertionMatrix: {"library_sizes": [array]}
     out_file << "{\n";
+    out_file << "  \"library_sizes\": [\n";
     for (size_t i = 0; i < final_group_sums.size(); i++) {
-        std::string group_name = (i < actual_group_names.size()) ? actual_group_names[i] : std::to_string(i);
-        out_file << "  \"" << group_name << "\": " << final_group_sums[i];
+        out_file << "    " << final_group_sums[i];
         if (i < final_group_sums.size() - 1) {
             out_file << ",";
         }
         out_file << "\n";
     }
+    out_file << "  ]\n";
     out_file << "}\n";
     out_file.close();
 }
