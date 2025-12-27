@@ -254,24 +254,34 @@ def precalculate_insertion_counts_bam(
     unique_group_ids = sorted(set(cell_groups.values()))
     
     # Determine group names:
-    # 1. If group_names is a dict: map barcodes to group names
+    # IMPORTANT: For bulk data, cell_groups should contain {"bulk.FILEPREFIX": 0}
+    # and group_names.json should use "bulk.FILEPREFIX" as the group name by default
+    # 1. If group_names is a dict: map barcodes to group names (use barcode if not in dict)
     # 2. If group_names is a list: use as-is (one per unique group ID)
-    # 3. Otherwise: use barcode names as group names (default)
+    # 3. Otherwise: use barcode names as group names (default - bulk.FILEPREFIX)
     if isinstance(group_names, dict):
         # Dict mapping barcodes to group names: {'bulk.FILE_PREFIX': 'GROUP_NAME'}
         # Map each unique group ID to its group name
+        # IMPORTANT: If barcode not in dict, use barcode itself (bulk.FILEPREFIX)
         group_names_list = []
         for gid in unique_group_ids:
             # Find a barcode that maps to this group ID
             group_name = None
+            barcode_found = None
             for barcode, bgid in cell_groups.items():
                 if bgid == gid:
-                    # Use mapping if provided, otherwise use barcode itself
-                    group_name = group_names.get(barcode, barcode)
+                    barcode_found = barcode
+                    # For bulk barcodes (bulk.FILEPREFIX), always use the barcode itself
+                    # This ensures group_names.json uses bulk.FILEPREFIX format
+                    if barcode.startswith("bulk."):
+                        group_name = barcode  # Always use bulk.FILEPREFIX for bulk data
+                    else:
+                        # For single-cell data, use mapping if provided, otherwise use barcode
+                        group_name = group_names.get(barcode, barcode)
                     break
             if group_name is None:
-                # Fallback: use group ID as string
-                group_name = str(gid)
+                # Fallback: use barcode if found, otherwise use group ID as string
+                group_name = barcode_found if barcode_found else str(gid)
             group_names_list.append(group_name)
     elif isinstance(group_names, list):
         # List of group names: validate length matches unique groups
@@ -521,8 +531,13 @@ def precalculate_insertion_counts_bam_multi(
             # Find the barcode prefix for this group ID (should be bam_prefixes[gid])
             if gid < len(bam_prefixes):
                 barcode_prefix = bam_prefixes[gid]
-                # Use mapping if provided, otherwise use barcode prefix itself
-                group_name = group_names.get(barcode_prefix, barcode_prefix)
+                # For bulk barcodes (bulk.FILEPREFIX), always use the barcode itself
+                # This ensures group_names.json uses bulk.FILEPREFIX format
+                if barcode_prefix.startswith("bulk."):
+                    group_name = barcode_prefix  # Always use bulk.FILEPREFIX for bulk data
+                else:
+                    # For single-cell data, use mapping if provided, otherwise use barcode prefix
+                    group_name = group_names.get(barcode_prefix, barcode_prefix)
             else:
                 group_name = str(gid)
             group_names_list.append(group_name)
