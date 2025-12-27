@@ -172,55 +172,7 @@ Eigen::MatrixXi pseudobulk_coverage(
     return run_with_py_interrupt_check(&matrix_loader_to_eigen_helper, std::move(tile_mat));
 }
 
-template <typename T>
-void parallel_map_helper(std::vector<std::future<T>> &futures, size_t threads, std::vector<T> *results = nullptr) {
-    // Non-threaded fallback
-    if (threads == 0) {
-        for (size_t i = 0; i < futures.size(); i++) {
-            if (results) {
-                (*results)[i] = futures[i].get();
-            } else {
-                futures[i].get();
-            }
-        }
-        return;
-    }
-
-    // Very basic threading, designed for small numbers of futures
-    std::atomic<size_t> task_id(0);
-    std::atomic<bool> has_error = false;
-    std::exception_ptr exception;
-    std::vector<std::thread> thread_vec;
-    for (size_t i = 0; i < threads; i++) {
-        thread_vec.push_back(std::thread([&futures, &task_id, &has_error, &exception, results] {
-            while (true) {
-                size_t cur_task = task_id.fetch_add(1);
-                if (cur_task >= futures.size()) break;
-                try {
-                    if (results) {
-                        (*results)[cur_task] = futures[cur_task].get();
-                    } else {
-                        futures[cur_task].get();
-                    }
-                } catch (...) {
-                    if (!has_error) {
-                        has_error = true;
-                        exception = std::current_exception();
-                    }
-                    break;
-                }
-            }
-        }));
-    }
-    for (auto &th : thread_vec) {
-        if (th.joinable()) {
-            th.join();
-        }
-    }
-    if (has_error) {
-        std::rethrow_exception(exception);
-    }
-}
+// Template implementation moved to fragments.hpp (must be in header for templates)
 
 // Helper function to read library_size.json from a fragments directory
 // Returns empty vector if file doesn't exist or can't be parsed
