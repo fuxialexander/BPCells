@@ -80,7 +80,7 @@ void write_matrix_dir_from_concat(std::vector<std::string> in_paths, std::string
     }
 
     bool row_major = is_row_major_matrix_dir(in_paths[0]);
-    
+
     for (const std::string &path : in_paths) {
         FileReaderBuilder rb(path);
         mats.push_back(std::make_unique<StoredMatrix<uint32_t>>(StoredMatrix<uint32_t>::openPacked(rb)));
@@ -92,12 +92,42 @@ void write_matrix_dir_from_concat(std::vector<std::string> in_paths, std::string
     } else {
         mat = std::make_unique<ConcatCols<uint32_t>>(std::move(mats), 0);
     }
-    
+
     FileWriterBuilder wb(out_path);
 
     run_with_py_interrupt_check(
         &StoredMatrixWriter<uint32_t>::write,
         StoredMatrixWriter<uint32_t>::createPacked(wb, row_major),
+        std::ref(*mat)
+    );
+}
+
+void write_matrix_dir_from_concat_experimental(std::vector<std::string> in_paths, std::string out_path, bool concat_rows) {
+    // Concatenate experimental format matrices (packed-uint-matrix-v9999)
+    // Used for precalculated pseudobulk coverage matrices
+    std::vector<std::unique_ptr<MatrixLoader<uint32_t>>> mats;
+
+    if (in_paths.size() == 0) {
+        throw std::runtime_error("write_matrix_dir_from_concat_experimental: Zero matrices given as input.");
+    }
+
+    for (const std::string &path : in_paths) {
+        FileReaderBuilder rb(path);
+        mats.push_back(std::make_unique<StoredMatrix<uint32_t>>(EXPERIMENTAL_openPackedSparseColumn<uint32_t>(rb)));
+    }
+
+    std::unique_ptr<MatrixLoader<uint32_t>> mat;
+    if (concat_rows) {
+        mat = std::make_unique<ConcatRows<uint32_t>>(std::move(mats), 0);
+    } else {
+        mat = std::make_unique<ConcatCols<uint32_t>>(std::move(mats), 0);
+    }
+
+    FileWriterBuilder wb(out_path);
+
+    run_with_py_interrupt_check(
+        &StoredMatrixWriter<uint32_t>::write,
+        EXPERIMENTAL_createPackedSparseColumn<uint32_t>(wb),
         std::ref(*mat)
     );
 }

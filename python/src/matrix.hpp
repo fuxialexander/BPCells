@@ -23,6 +23,10 @@ void write_matrix_dir_from_memory(const Eigen::SparseMatrix<uint32_t> in, std::s
 
 void write_matrix_dir_from_concat(std::vector<std::string> in_paths, std::string out_path, bool concat_cols);
 
+// Concatenate experimental format matrices (packed-uint-matrix-v9999)
+// Used for precalculated pseudobulk coverage matrices
+void write_matrix_dir_from_concat_experimental(std::vector<std::string> in_paths, std::string out_path, bool concat_rows);
+
 void write_matrix_dir_from_h5ad(std::string h5ad_path, std::string out_path, std::string group);
 
 std::vector<Eigen::SparseMatrix<uint32_t>> load_matrix_dir_subset(
