@@ -21,11 +21,25 @@ namespace BPCells::py {
 
 void write_matrix_dir_from_memory(const Eigen::SparseMatrix<uint32_t> in, std::string out_path, bool row_major = false);
 
+// Write matrix in experimental v9999 format (for testing write_matrix_dir_from_concat_experimental)
+void write_matrix_dir_from_memory_experimental(const Eigen::SparseMatrix<uint32_t> in, std::string out_path);
+
 void write_matrix_dir_from_concat(std::vector<std::string> in_paths, std::string out_path, bool concat_cols);
 
 // Concatenate experimental format matrices (packed-uint-matrix-v9999)
 // Used for precalculated pseudobulk coverage matrices
-void write_matrix_dir_from_concat_experimental(std::vector<std::string> in_paths, std::string out_path, bool concat_rows);
+// Supports hierarchical merge for better performance with many input matrices.
+// batch_size: number of matrices to merge at once (default 16)
+// threads: number of parallel merge threads (default 1)
+// temp_dir: directory for intermediate files (default: out_path.parent / ".bpcells_tmp")
+void write_matrix_dir_from_concat_experimental(
+    std::vector<std::string> in_paths,
+    std::string out_path,
+    bool concat_rows,
+    uint32_t batch_size = 16,
+    uint32_t threads = 1,
+    std::string temp_dir = ""
+);
 
 void write_matrix_dir_from_h5ad(std::string h5ad_path, std::string out_path, std::string group);
 

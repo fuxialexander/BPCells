@@ -102,8 +102,20 @@ template <typename T> class StoredMatrixWriter : public MatrixWriter<T> {
     }
 
     void write(MatrixLoader<T> &mat_in, std::atomic<bool> *user_interrupt = NULL) override {
+        writeInternal(mat_in, user_interrupt, false);
+    }
+
+    // Write with assumption that input rows are already sorted (skips sorting check)
+    // Use this when writing from ConcatRows which produces sorted output
+    void writeSorted(MatrixLoader<T> &mat_in, std::atomic<bool> *user_interrupt = NULL) {
+        writeInternal(mat_in, user_interrupt, true);
+    }
+
+  private:
+    void writeInternal(MatrixLoader<T> &mat_in, std::atomic<bool> *user_interrupt, bool assume_sorted) {
         // Ensure that we write matrices sorted by row
-        OrderRows<T> mat((std::unique_ptr<MatrixLoader<T>>(&mat_in)));
+        // When assume_sorted is true, we skip the sorting check for better performance
+        OrderRows<T> mat((std::unique_ptr<MatrixLoader<T>>(&mat_in)), 1024, assume_sorted);
         // Don't delete our original matrix
         mat.preserve_input_loader();
         uint32_t col = 0;

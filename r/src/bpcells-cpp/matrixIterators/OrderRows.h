@@ -1,5 +1,5 @@
 // Copyright 2022 BPCells contributors
-// 
+//
 // Licensed under the Apache License, Version 2.0 <LICENSE-APACHE or
 // https://www.apache.org/licenses/LICENSE-2.0> or the MIT license
 // <LICENSE-MIT or https://opensource.org/licenses/MIT>, at your
@@ -24,11 +24,15 @@ template <class T> class OrderRows : public MatrixLoaderWrapper<T> {
     uint32_t idx = 0;
     uint32_t cap = 0;
     uint32_t load_size;
+    bool assume_sorted; // Skip sorting check when we know input is sorted
 
   public:
-    OrderRows(std::unique_ptr<MatrixLoader<T>> &&loader, uint32_t load_size = 1024)
+    // If assume_sorted is true, skip the sorting check entirely (useful when input
+    // is known to be sorted, e.g., from ConcatRows with row-offset-adjusted data)
+    OrderRows(std::unique_ptr<MatrixLoader<T>> &&loader, uint32_t load_size = 1024, bool assume_sorted = false)
         : MatrixLoaderWrapper<T>(std::move(loader))
-        , load_size(load_size) {
+        , load_size(load_size)
+        , assume_sorted(assume_sorted) {
         row_data.resize(this->loader->rows());
         row_buf.resize(this->loader->rows());
         val_data.resize(this->loader->rows());
@@ -67,11 +71,17 @@ template <class T> class OrderRows : public MatrixLoaderWrapper<T> {
 
                 std::memmove(val_data.data() + cap, val_ptr, sizeof(T) * loaded);
 
-                for (uint32_t i = 0; i < loaded; i++) {
-                    row_data[cap + i] = row_ptr[i];
-                    // Assume no duplicate row indices so we don't need <=
-                    if (row_ptr[i] < prev_row) needs_reorder = true;
-                    prev_row = row_ptr[i];
+                if (assume_sorted) {
+                    // Fast path: just copy row data without checking order
+                    std::memmove(row_data.data() + cap, row_ptr, sizeof(uint32_t) * loaded);
+                } else {
+                    // Check if reordering is needed while copying
+                    for (uint32_t i = 0; i < loaded; i++) {
+                        row_data[cap + i] = row_ptr[i];
+                        // Assume no duplicate row indices so we don't need <=
+                        if (row_ptr[i] < prev_row) needs_reorder = true;
+                        prev_row = row_ptr[i];
+                    }
                 }
                 cap += loaded;
             }
