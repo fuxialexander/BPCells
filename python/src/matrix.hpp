@@ -21,6 +21,9 @@ namespace BPCells::py {
 
 void write_matrix_dir_from_memory(const Eigen::SparseMatrix<uint32_t> in, std::string out_path, bool row_major = false);
 
+// Write matrix in experimental v9999 format (for testing write_matrix_dir_from_concat_experimental)
+void write_matrix_dir_from_memory_experimental(const Eigen::SparseMatrix<uint32_t> in, std::string out_path);
+
 void write_matrix_dir_from_concat(std::vector<std::string> in_paths, std::string out_path, bool concat_cols);
 
 // Concatenate experimental format matrices (packed-uint-matrix-v9999)

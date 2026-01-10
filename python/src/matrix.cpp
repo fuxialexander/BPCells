@@ -61,6 +61,29 @@ void write_matrix_dir_from_memory(
     );
 }
 
+void write_matrix_dir_from_memory_experimental(
+    const Eigen::SparseMatrix<uint32_t> in, std::string out_path
+) {
+    const Eigen::Map<Eigen::SparseMatrix<uint32_t>> in_map(
+        in.rows(),
+        in.cols(),
+        in.nonZeros(),
+        (int *)in.outerIndexPtr(),
+        (int *)in.innerIndexPtr(),
+        (uint32_t *)in.valuePtr()
+    );
+
+    auto mat = std::make_unique<CSparseMatrix<uint32_t>>(in_map);
+
+    FileWriterBuilder wb(out_path);
+
+    run_with_py_interrupt_check(
+        &StoredMatrixWriter<uint32_t>::write,
+        EXPERIMENTAL_createPackedSparseColumn<uint32_t>(wb),
+        std::ref(*mat)
+    );
+}
+
 static bool is_row_major_matrix_dir(std::string path) {
     FileReaderBuilder rb(path);
     auto storage_order_reader = rb.openStringReader("storage_order");

@@ -61,6 +61,7 @@ PYBIND11_MODULE(cpp, m) {
     m.def("query_precalculated_pseudobulk_coverage", &BPCells::py::query_precalculated_pseudobulk_coverage);
         
     m.def("write_matrix_dir_from_memory", &BPCells::py::write_matrix_dir_from_memory);
+    m.def("write_matrix_dir_from_memory_experimental", &BPCells::py::write_matrix_dir_from_memory_experimental);
     m.def("write_matrix_dir_from_concat", &BPCells::py::write_matrix_dir_from_concat);
     m.def("write_matrix_dir_from_concat_experimental", &BPCells::py::write_matrix_dir_from_concat_experimental,
           pybind11::arg("in_paths"),
