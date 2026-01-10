@@ -16,12 +16,16 @@
 #include <string>
 #include <thread>
 #include <utility>
+#include <random>
+#include <sstream>
+#include <iomanip>
 
 #include <Eigen/SparseCore>
 #include "bpcells-cpp/matrixIterators/StoredMatrixSparseColumn.h"
 
 #include "bpcells-cpp/arrayIO/binaryfile.h"
 #include "bpcells-cpp/arrayIO/vector.h"
+#include "bpcells-cpp/utils/filesystem_compat.h"
 
 #include "bpcells-cpp/matrixIterators/CSparseMatrix.h"
 #include "bpcells-cpp/matrixIterators/MatrixIndexSelect.h"
@@ -102,14 +106,56 @@ void write_matrix_dir_from_concat(std::vector<std::string> in_paths, std::string
     );
 }
 
-void write_matrix_dir_from_concat_experimental(std::vector<std::string> in_paths, std::string out_path, bool concat_rows) {
-    // Concatenate experimental format matrices (packed-uint-matrix-v9999)
-    // Used for precalculated pseudobulk coverage matrices
+// Helper to generate a unique temp directory name
+static std::string generate_unique_id() {
+    std::random_device rd;
+    std::mt19937 gen(rd());
+    std::uniform_int_distribution<uint64_t> dis;
+    std::stringstream ss;
+    ss << std::hex << std::setfill('0') << std::setw(16) << dis(gen);
+    return ss.str();
+}
+
+// Internal helper for merging a batch of experimental matrices (single-threaded)
+static void merge_batch_experimental_internal(
+    const std::vector<std::string>& in_paths,
+    const std::string& out_path,
+    bool concat_rows,
+    std::atomic<bool>* user_interrupt
+) {
     std::vector<std::unique_ptr<MatrixLoader<uint32_t>>> mats;
 
-    if (in_paths.size() == 0) {
-        throw std::runtime_error("write_matrix_dir_from_concat_experimental: Zero matrices given as input.");
+    for (const std::string &path : in_paths) {
+        FileReaderBuilder rb(path);
+        mats.push_back(std::make_unique<StoredMatrix<uint32_t>>(EXPERIMENTAL_openPackedSparseColumn<uint32_t>(rb)));
     }
+
+    std::unique_ptr<MatrixLoader<uint32_t>> mat;
+    if (concat_rows) {
+        mat = std::make_unique<ConcatRows<uint32_t>>(std::move(mats), 0);
+    } else {
+        mat = std::make_unique<ConcatCols<uint32_t>>(std::move(mats), 0);
+    }
+
+    FileWriterBuilder wb(out_path);
+    auto writer = EXPERIMENTAL_createPackedSparseColumn<uint32_t>(wb);
+
+    // ConcatRows produces sorted output (row offsets create non-overlapping, increasing ranges)
+    // so we can skip the sorting check for better performance
+    if (concat_rows) {
+        writer.writeSorted(*mat, user_interrupt);
+    } else {
+        writer.write(*mat, user_interrupt);
+    }
+}
+
+// Simple concat for small number of matrices
+static void write_matrix_dir_from_concat_experimental_simple(
+    const std::vector<std::string>& in_paths,
+    const std::string& out_path,
+    bool concat_rows
+) {
+    std::vector<std::unique_ptr<MatrixLoader<uint32_t>>> mats;
 
     for (const std::string &path : in_paths) {
         FileReaderBuilder rb(path);
@@ -125,11 +171,157 @@ void write_matrix_dir_from_concat_experimental(std::vector<std::string> in_paths
 
     FileWriterBuilder wb(out_path);
 
-    run_with_py_interrupt_check(
-        &StoredMatrixWriter<uint32_t>::write,
-        EXPERIMENTAL_createPackedSparseColumn<uint32_t>(wb),
-        std::ref(*mat)
-    );
+    // ConcatRows produces sorted output, so use writeSorted for better performance
+    if (concat_rows) {
+        run_with_py_interrupt_check(
+            &StoredMatrixWriter<uint32_t>::writeSorted,
+            EXPERIMENTAL_createPackedSparseColumn<uint32_t>(wb),
+            std::ref(*mat)
+        );
+    } else {
+        run_with_py_interrupt_check(
+            &StoredMatrixWriter<uint32_t>::write,
+            EXPERIMENTAL_createPackedSparseColumn<uint32_t>(wb),
+            std::ref(*mat)
+        );
+    }
+}
+
+void write_matrix_dir_from_concat_experimental(
+    std::vector<std::string> in_paths,
+    std::string out_path,
+    bool concat_rows,
+    uint32_t batch_size,
+    uint32_t threads,
+    std::string temp_dir
+) {
+    // Concatenate experimental format matrices (packed-uint-matrix-v9999)
+    // Used for precalculated pseudobulk coverage matrices
+    // Supports hierarchical merge for better performance with many matrices
+
+    if (in_paths.size() == 0) {
+        throw std::runtime_error("write_matrix_dir_from_concat_experimental: Zero matrices given as input.");
+    }
+
+    if (in_paths.size() == 1) {
+        // Just copy the single matrix
+        write_matrix_dir_from_concat_experimental_simple(in_paths, out_path, concat_rows);
+        return;
+    }
+
+    // If we have few enough matrices, use the simple merge
+    if (in_paths.size() <= batch_size) {
+        write_matrix_dir_from_concat_experimental_simple(in_paths, out_path, concat_rows);
+        return;
+    }
+
+    // Set up temp directory
+    std_fs::path temp_base;
+    bool created_temp_dir = false;
+    if (temp_dir.empty()) {
+        std_fs::path out_parent = std_fs::path(out_path).parent_path();
+        if (out_parent.empty()) out_parent = ".";
+        temp_base = out_parent / (".bpcells_tmp_" + generate_unique_id());
+    } else {
+        temp_base = std_fs::path(temp_dir);
+    }
+
+    if (!std_fs::exists(temp_base)) {
+        std_fs::create_directories(temp_base);
+        created_temp_dir = true;
+    }
+
+    // RAII cleanup helper
+    struct TempDirCleanup {
+        std_fs::path path;
+        bool should_remove;
+        ~TempDirCleanup() {
+            if (should_remove && std_fs::exists(path)) {
+                std::error_code ec;
+                std_fs::remove_all(path, ec);
+            }
+        }
+    };
+    TempDirCleanup cleanup{temp_base, created_temp_dir};
+
+    // Split paths into batches
+    std::vector<std::vector<std::string>> batches;
+    size_t n = in_paths.size();
+    size_t num_batches = (n + batch_size - 1) / batch_size;
+
+    for (size_t i = 0; i < num_batches; i++) {
+        size_t start = i * batch_size;
+        size_t end = std::min(start + batch_size, n);
+        batches.emplace_back(in_paths.begin() + start, in_paths.begin() + end);
+    }
+
+    // Merge batches to intermediate files
+    std::vector<std::string> intermediate_paths;
+
+    if (threads <= 1) {
+        // Single-threaded: merge batches sequentially
+        run_with_py_interrupt_check([&](std::atomic<bool>* user_interrupt) {
+            for (size_t i = 0; i < batches.size(); i++) {
+                if (user_interrupt && *user_interrupt) return;
+
+                std::string intermediate_path = (temp_base / ("batch_" + std::to_string(i))).string();
+                merge_batch_experimental_internal(batches[i], intermediate_path, concat_rows, user_interrupt);
+                intermediate_paths.push_back(intermediate_path);
+            }
+        });
+    } else {
+        // Multi-threaded: merge batches in parallel
+        intermediate_paths.resize(batches.size());
+        for (size_t i = 0; i < batches.size(); i++) {
+            intermediate_paths[i] = (temp_base / ("batch_" + std::to_string(i))).string();
+        }
+
+        run_with_py_interrupt_check([&](std::atomic<bool>* user_interrupt) {
+            std::vector<std::future<void>> futures;
+            std::atomic<size_t> task_id(0);
+
+            // Create tasks using deferred execution
+            for (size_t i = 0; i < batches.size(); i++) {
+                futures.push_back(std::async(
+                    std::launch::deferred,
+                    [&batches, &intermediate_paths, concat_rows, i, user_interrupt]() {
+                        merge_batch_experimental_internal(batches[i], intermediate_paths[i], concat_rows, user_interrupt);
+                    }
+                ));
+            }
+
+            // Execute with thread pool
+            uint32_t actual_threads = std::min(threads, static_cast<uint32_t>(batches.size()));
+            std::vector<std::thread> thread_vec;
+
+            for (uint32_t t = 0; t < actual_threads; t++) {
+                thread_vec.push_back(std::thread([&futures, &task_id, user_interrupt] {
+                    while (true) {
+                        if (user_interrupt && *user_interrupt) break;
+                        size_t cur_task = task_id.fetch_add(1);
+                        if (cur_task >= futures.size()) break;
+                        futures[cur_task].get();
+                    }
+                }));
+            }
+
+            for (auto& th : thread_vec) {
+                if (th.joinable()) th.join();
+            }
+        });
+    }
+
+    // Recursively merge intermediate files
+    if (intermediate_paths.size() <= batch_size) {
+        // Final merge directly to output
+        write_matrix_dir_from_concat_experimental_simple(intermediate_paths, out_path, concat_rows);
+    } else {
+        // Need another level of recursion
+        std::string next_temp_dir = (temp_base / "level2").string();
+        write_matrix_dir_from_concat_experimental(
+            intermediate_paths, out_path, concat_rows, batch_size, threads, next_temp_dir
+        );
+    }
 }
 
 void write_matrix_dir_from_h5ad(std::string h5ad_path, std::string out_path, std::string group) {

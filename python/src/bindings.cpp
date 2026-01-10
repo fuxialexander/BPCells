@@ -62,7 +62,13 @@ PYBIND11_MODULE(cpp, m) {
         
     m.def("write_matrix_dir_from_memory", &BPCells::py::write_matrix_dir_from_memory);
     m.def("write_matrix_dir_from_concat", &BPCells::py::write_matrix_dir_from_concat);
-    m.def("write_matrix_dir_from_concat_experimental", &BPCells::py::write_matrix_dir_from_concat_experimental);
+    m.def("write_matrix_dir_from_concat_experimental", &BPCells::py::write_matrix_dir_from_concat_experimental,
+          pybind11::arg("in_paths"),
+          pybind11::arg("out_path"),
+          pybind11::arg("concat_rows"),
+          pybind11::arg("batch_size") = 16,
+          pybind11::arg("threads") = 1,
+          pybind11::arg("temp_dir") = "");
     m.def("write_matrix_dir_from_h5ad", &BPCells::py::write_matrix_dir_from_h5ad);
     
     m.def("load_matrix_dir_subset", &BPCells::py::load_matrix_dir_subset);
