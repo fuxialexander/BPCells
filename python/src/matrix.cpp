@@ -302,6 +302,8 @@ void write_matrix_dir_from_concat_experimental(
         run_with_py_interrupt_check([&](std::atomic<bool>* user_interrupt) {
             std::vector<std::future<void>> futures;
             std::atomic<size_t> task_id(0);
+            std::mutex exception_mutex;
+            std::exception_ptr first_exception;
 
             // Create tasks using deferred execution
             for (size_t i = 0; i < batches.size(); i++) {
@@ -318,12 +320,28 @@ void write_matrix_dir_from_concat_experimental(
             std::vector<std::thread> thread_vec;
 
             for (uint32_t t = 0; t < actual_threads; t++) {
-                thread_vec.push_back(std::thread([&futures, &task_id, user_interrupt] {
+                thread_vec.push_back(std::thread([&futures, &task_id, user_interrupt, &exception_mutex, &first_exception] {
                     while (true) {
                         if (user_interrupt && *user_interrupt) break;
+                        
+                        // Check if another thread already encountered an exception
+                        {
+                            std::lock_guard<std::mutex> lock(exception_mutex);
+                            if (first_exception) break;
+                        }
+                        
                         size_t cur_task = task_id.fetch_add(1);
                         if (cur_task >= futures.size()) break;
-                        futures[cur_task].get();
+                        
+                        try {
+                            futures[cur_task].get();
+                        } catch (...) {
+                            std::lock_guard<std::mutex> lock(exception_mutex);
+                            if (!first_exception) {
+                                first_exception = std::current_exception();
+                            }
+                            break;
+                        }
                     }
                 }));
             }
@@ -331,7 +349,23 @@ void write_matrix_dir_from_concat_experimental(
             for (auto& th : thread_vec) {
                 if (th.joinable()) th.join();
             }
+            
+            // Re-throw the first exception encountered
+            if (first_exception) {
+                std::rethrow_exception(first_exception);
+            }
         });
+    }
+
+    // Validate that all intermediate files were created
+    for (size_t i = 0; i < intermediate_paths.size(); i++) {
+        if (!std_fs::exists(intermediate_paths[i])) {
+            throw std::runtime_error(
+                "write_matrix_dir_from_concat_experimental: Intermediate batch " + 
+                std::to_string(i) + " was not created at " + intermediate_paths[i] +
+                ". This may indicate an earlier error was silently ignored."
+            );
+        }
     }
 
     // Recursively merge intermediate files

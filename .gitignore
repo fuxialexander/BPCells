@@ -37,3 +37,4 @@ mytest*.R
 .dockerignore
 .lintr
 bench/
+.serena/
