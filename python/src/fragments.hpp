@@ -52,7 +52,8 @@ void precalculate_pseudobulk_coverage(
     std::vector<int32_t> cell_groups,
     int bin_size,
     int threads,
-    std::optional<std::vector<std::string>> group_names = std::nullopt
+    std::optional<std::vector<std::string>> group_names = std::nullopt,
+    bool preserve_chrom_order = false  // NEW: if true, preserve user's chromosome order instead of fragment order
 );
 
 

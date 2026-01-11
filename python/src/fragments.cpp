@@ -22,6 +22,7 @@
 #include "bpcells-cpp/arrayIO/vector.h"
 #include "bpcells-cpp/fragmentIterators/BedFragments.h"
 #include "bpcells-cpp/fragmentIterators/CellSelect.h"
+#include "bpcells-cpp/fragmentIterators/ChrSelect.h"
 #include "bpcells-cpp/fragmentIterators/MergeFragments.h"
 #include "bpcells-cpp/fragmentIterators/ShiftCoords.h"
 #include "bpcells-cpp/fragmentIterators/StoredFragments.h"
@@ -269,8 +270,9 @@ static std::vector<uint64_t> precalculate_pseudobulk_coverage_helper(
     const std::vector<uint32_t> &end,
     const std::vector<uint32_t> &width,
     const std::vector<std::string> &chr_levels,
-    
+
     int bin_size,
+    bool use_canonical_order,  // NEW: if true, use chr_levels order instead of fragment order
 
     std::atomic<bool> *user_interrupt
 ) {
@@ -291,6 +293,11 @@ static std::vector<uint64_t> precalculate_pseudobulk_coverage_helper(
             );
         }
         frags = std::make_unique<MergeFragments>(std::move(frag_loaders), chr_levels);
+    }
+
+    // NEW: Wrap with ChrNameSelect to reorder chromosomes to user-specified order
+    if (use_canonical_order) {
+        frags = std::make_unique<ChrNameSelect>(std::move(frags), chr_levels);
     }
 
     // Merge cells
@@ -335,6 +342,11 @@ static std::vector<uint64_t> precalculate_pseudobulk_coverage_helper(
             );
         }
         frags_new = std::make_unique<MergeFragments>(std::move(frag_loaders_new), chr_levels);
+    }
+
+    // NEW: Wrap with ChrNameSelect to reorder chromosomes (same as first loading)
+    if (use_canonical_order) {
+        frags_new = std::make_unique<ChrNameSelect>(std::move(frags_new), chr_levels);
     }
 
     // Create a new CellMerge object
@@ -387,7 +399,8 @@ void precalculate_pseudobulk_coverage(
     std::vector<int32_t> cell_groups,
     int bin_size,
     int threads,
-    std::optional<std::vector<std::string>> group_names
+    std::optional<std::vector<std::string>> group_names,
+    bool preserve_chrom_order  // NEW: if true, preserve user's chromosome order instead of fragment order
 ) {
     // Create the arguments needed for TileMatrix: start, tile_width, chr_id, chr_levels (end =
     // chr_len)
@@ -413,15 +426,28 @@ void precalculate_pseudobulk_coverage(
     std::vector<uint32_t> chr_id;
     std::unordered_map<std::string, uint32_t> chr_name_lookup;
     std::vector<std::string> chr_levels;
-    for (int32_t i = 0; i < frags.chrCount(); i++) {
-        if (frags.chrNames(i) == NULL) {
-            throw std::runtime_error("pseudobulk_coverage: missing chr names in input fragments");
+
+    if (preserve_chrom_order) {
+        // NEW: Use user-provided chromosome order
+        // chr_levels = user's chr order
+        // chr_id = sequential [0, 1, 2, ...]
+        // ChrNameSelect will reorder fragment output to match
+        chr_levels = chr;
+        for (uint32_t i = 0; i < chr.size(); i++) {
+            chr_id.push_back(i);
         }
-        chr_name_lookup[std::string(frags.chrNames(i))] = i;
-        chr_levels.push_back(std::string(frags.chrNames(i)));
-    }
-    for (auto &c : chr) {
-        chr_id.push_back(chr_name_lookup[c]);
+    } else {
+        // Original behavior: use fragment file chromosome order
+        for (int32_t i = 0; i < frags.chrCount(); i++) {
+            if (frags.chrNames(i) == NULL) {
+                throw std::runtime_error("pseudobulk_coverage: missing chr names in input fragments");
+            }
+            chr_name_lookup[std::string(frags.chrNames(i))] = i;
+            chr_levels.push_back(std::string(frags.chrNames(i)));
+        }
+        for (auto &c : chr) {
+            chr_id.push_back(chr_name_lookup[c]);
+        }
     }
 
     // Create the arguments needed for MergeCellls (group_id, group_names)
@@ -530,7 +556,8 @@ void precalculate_pseudobulk_coverage(
                                             &all_group_sums,
                                             threads,
                                             chunks,
-                                            bin_size](std::atomic<bool> *user_interrupt) {
+                                            bin_size,
+                                            preserve_chrom_order](std::atomic<bool> *user_interrupt) {
             std::vector<std::future<std::vector<uint64_t>>> task_vec;
             all_group_sums.resize(chunks);
 
@@ -551,6 +578,7 @@ void precalculate_pseudobulk_coverage(
                     std::cref(tile_width),
                     std::cref(chr_levels),
                     bin_size,
+                    preserve_chrom_order,
 
                     user_interrupt
                 ));
@@ -592,7 +620,8 @@ void precalculate_pseudobulk_coverage(
                                             &all_group_sums,
                                             threads,
                                             chunks,
-                                            bin_size](std::atomic<bool> *user_interrupt) {
+                                            bin_size,
+                                            preserve_chrom_order](std::atomic<bool> *user_interrupt) {
             std::vector<std::future<std::vector<uint64_t>>> task_vec;
             all_group_sums.resize(chunks);
 
@@ -613,6 +642,7 @@ void precalculate_pseudobulk_coverage(
                     std::cref(tile_width),
                     std::cref(chr_levels),
                     bin_size,
+                    preserve_chrom_order,
 
                     user_interrupt
                 ));

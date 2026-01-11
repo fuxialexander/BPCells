@@ -36,10 +36,11 @@ PYBIND11_MODULE(cpp, m) {
     m.def("chr_names_fragments_dir", &BPCells::py::chr_names_fragments_dir);
     m.def("pseudobulk_coverage", &BPCells::py::pseudobulk_coverage);
     m.def("precalculate_pseudobulk_coverage", &BPCells::py::precalculate_pseudobulk_coverage,
-          pybind11::arg("fragments_path"), pybind11::arg("output_path"), 
-          pybind11::arg("tmp_path"), pybind11::arg("chr"), pybind11::arg("chr_size"), 
+          pybind11::arg("fragments_path"), pybind11::arg("output_path"),
+          pybind11::arg("tmp_path"), pybind11::arg("chr"), pybind11::arg("chr_size"),
           pybind11::arg("cell_groups"), pybind11::arg("bin_size"), pybind11::arg("threads"),
-          pybind11::arg("group_names") = nullptr);
+          pybind11::arg("group_names") = nullptr,
+          pybind11::arg("preserve_chrom_order") = false);
            m.def("bam_has_cb_tags", &BPCells::py::bam_has_cb_tags,
                  pybind11::arg("bam_path"), pybind11::arg("barcode_tag") = "CB", pybind11::arg("sample_size") = 10000);
            m.def("discover_cells_from_bam", &BPCells::py::discover_cells_from_bam,

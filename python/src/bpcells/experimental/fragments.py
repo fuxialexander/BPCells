@@ -689,7 +689,8 @@ class PrecalculatedInsertionMatrix:
 
 def precalculate_insertion_counts(fragments: Union[str, List[str]], output_dir: str, cell_groups: Union[Sequence[int], pd.Categorical],
                                  chrom_sizes: Union[str, Dict[str, int]], threads: int = 0,
-                                 group_names: Optional[List[str]] = None):
+                                 group_names: Optional[List[str]] = None,
+                                 preserve_chrom_order: bool = False):
     """Precalculate per-base insertion counts from fragment data
 
     The current implementation is EXPERIMENTAL, and will crash for matrices with more than
@@ -722,6 +723,9 @@ def precalculate_insertion_counts(fragments: Union[str, List[str]], output_dir: 
         threads (int): Number of threads to use during matrix calculation (default = 1)
         group_names (list[str], optional): Names for each group in the same order as group indices (0, 1, 2, ...).
             Ignored if cell_groups is pd.Categorical.
+        preserve_chrom_order (bool): If True, preserve the chromosome order from chrom_sizes instead of
+            re-ordering to match fragment file order. This ensures consistent chrom_offsets across different
+            fragment files for concatenation. Default is False for backward compatibility.
 
     Returns:
         A :class:`PrecalculatedInsertionMatrix` object
@@ -803,10 +807,14 @@ def precalculate_insertion_counts(fragments: Union[str, List[str]], output_dir: 
         chrom_sizes = pd.read_csv(chrom_sizes, sep="\t", names=["chrom", "size"])
         chrom_sizes = {t.chrom: t.size for t in chrom_sizes.itertuples()}
 
-    # Re-order chrom_sizes to match the fragment file chromosome order (use first file as reference)
+    # Get chromosome order from fragment file for filtering
     chrom_order = bpcells.cpp.chr_names_fragments_dir(fragments_normalized[0])
+    # Filter to chromosomes present in fragments
     chrom_sizes = dict(i for i in chrom_sizes.items() if i[0] in chrom_order)
-    chrom_sizes = dict(sorted(chrom_sizes.items(), key = lambda x: chrom_order.index(x[0])))
+
+    if not preserve_chrom_order:
+        # Re-order chrom_sizes to match the fragment file chromosome order (original behavior)
+        chrom_sizes = dict(sorted(chrom_sizes.items(), key = lambda x: chrom_order.index(x[0])))
 
     # Use context manager to ensure temp directory stays alive during C++ execution
     # and is properly cleaned up even if an exception occurs
@@ -820,7 +828,8 @@ def precalculate_insertion_counts(fragments: Union[str, List[str]], output_dir: 
             cell_groups_array,
             1,
             threads,
-            group_names
+            group_names,
+            preserve_chrom_order
         )
 
     # Filter library_size.json if we had filtered cells
@@ -928,13 +937,14 @@ def precalculate_insertion_counts(fragments: Union[str, List[str]], output_dir: 
 
 
 def precalculate_insertion_counts_binned(
-    fragments: Union[str, List[str]], 
-    output_dir: str, 
+    fragments: Union[str, List[str]],
+    output_dir: str,
     cell_groups: Union[Sequence[int], pd.Categorical],
-    chrom_sizes: Union[str, Dict[str, int]], 
+    chrom_sizes: Union[str, Dict[str, int]],
     bin_size: int = 500,
     threads: int = 16,
-    group_names: Optional[List[str]] = None
+    group_names: Optional[List[str]] = None,
+    preserve_chrom_order: bool = False
 ) -> 'DirMatrix':
     """Precalculate binned insertion counts from fragment data
     
@@ -960,6 +970,9 @@ def precalculate_insertion_counts_binned(
         threads (int): Number of threads to use during matrix calculation (default = 16, creates threads*4 chunks for parallelization)
         group_names (list[str], optional): Names for each group in the same order as group indices (0, 1, 2, ...).
             Ignored if cell_groups is pd.Categorical.
+        preserve_chrom_order (bool): If True, preserve the chromosome order from chrom_sizes instead of
+            re-ordering to match fragment file order. This ensures consistent chrom_offsets across different
+            fragment files for concatenation. Default is False for backward compatibility.
 
     Returns:
         DirMatrix: A disk-backed BPCells matrix object. The matrix has shape (n_pseudobulks, n_bins) where:
@@ -1071,15 +1084,19 @@ def precalculate_insertion_counts_binned(
         chrom_sizes = pd.read_csv(chrom_sizes, sep="\t", names=["chrom", "size"])
         chrom_sizes = {t.chrom: t.size for t in chrom_sizes.itertuples()}
 
-    # Re-order chrom_sizes to match the fragment file chromosome order (use first file as reference)
+    # Get chromosome order from fragment file for filtering
     chrom_order = bpcells.cpp.chr_names_fragments_dir(fragments_normalized[0])
+    # Filter to chromosomes present in fragments
     chrom_sizes = dict(i for i in chrom_sizes.items() if i[0] in chrom_order)
-    chrom_sizes = dict(sorted(chrom_sizes.items(), key = lambda x: chrom_order.index(x[0])))
+
+    if not preserve_chrom_order:
+        # Re-order chrom_sizes to match the fragment file chromosome order (original behavior)
+        chrom_sizes = dict(sorted(chrom_sizes.items(), key = lambda x: chrom_order.index(x[0])))
 
     # Calculate chromosome lengths in bins (for metadata)
     chrom_bin_counts = {chr: (size + bin_size - 1) // bin_size for chr, size in chrom_sizes.items()}
     total_bins = sum(chrom_bin_counts.values())
-    
+
     # Use context manager to ensure temp directory stays alive during C++ execution
     # and is properly cleaned up even if an exception occurs
     with tempfile.TemporaryDirectory() as tmp_dir:
@@ -1094,7 +1111,8 @@ def precalculate_insertion_counts_binned(
             cell_groups_array,
             bin_size,  # Use the specified bin_size instead of hardcoded 1
             threads,
-            group_names
+            group_names,
+            preserve_chrom_order
         )
     
     # Save metadata about binning
