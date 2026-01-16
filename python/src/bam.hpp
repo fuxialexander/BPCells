@@ -35,6 +35,7 @@ std::vector<std::string> discover_cells_from_bam_multi(
 );
 
 // Calculate pseudobulk coverage directly from BAM file
+// signal_mode: 0 = tn5 (insertion counts for ATAC-seq), 1 = chip (coverage counts for ChIP-seq)
 void precalculate_pseudobulk_coverage_bam(
     std::string bam_path,
     std::string output_path,
@@ -46,11 +47,13 @@ void precalculate_pseudobulk_coverage_bam(
     int shift_end,
     int bin_size,
     int threads,
-    std::optional<std::vector<std::string>> group_names = std::nullopt
+    std::optional<std::vector<std::string>> group_names = std::nullopt,
+    int signal_mode = 0  // 0 = tn5 (insertion), 1 = chip (coverage)
 );
 
 // Calculate pseudobulk coverage directly from multiple BAM files
 // Each BAM file gets a unique cell prefix (e.g., "bulk.FILENAME") to distinguish cells
+// signal_mode: 0 = tn5 (insertion counts for ATAC-seq), 1 = chip (coverage counts for ChIP-seq)
 void precalculate_pseudobulk_coverage_bam_multi(
     std::vector<std::string> bam_paths,
     std::vector<std::string> bam_prefixes,  // Cell prefixes for each BAM (e.g., "bulk.FILENAME")
@@ -63,7 +66,8 @@ void precalculate_pseudobulk_coverage_bam_multi(
     int shift_end,
     int bin_size,
     int threads,
-    std::optional<std::vector<std::string>> group_names = std::nullopt
+    std::optional<std::vector<std::string>> group_names = std::nullopt,
+    int signal_mode = 0  // 0 = tn5 (insertion), 1 = chip (coverage)
 );
 
 } // namespace BPCells::py

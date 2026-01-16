@@ -32,6 +32,7 @@
 #include "bpcells-cpp/matrixIterators/StoredMatrixWriter.h"
 #include "bpcells-cpp/matrixIterators/RenameDims.h"
 #include "bpcells-cpp/matrixIterators/TileMatrix.h"
+#include "bpcells-cpp/matrixIterators/CoverageMatrix.h"
 #include "bpcells-cpp/utils/filesystem_compat.h"
 
 namespace BPCells::py {
@@ -167,6 +168,7 @@ std::vector<std::string> discover_cells_from_bam_multi(
 // This helper MUST instantiate BamFragments locally inside the thread for thread safety
 // OPTIMIZED: Accepts expected_cell_count to skip redundant pre-scan (if > 0)
 // OPTIMIZED: Reuses fragment loader to avoid double loading
+// signal_mode: 0 = tn5 (insertion counts), 1 = chip (coverage counts)
 static std::vector<uint64_t> precalculate_pseudobulk_coverage_bam_helper(
     std::string bam_path,
     std::string chunk_output_path,
@@ -180,11 +182,12 @@ static std::vector<uint64_t> precalculate_pseudobulk_coverage_bam_helper(
     const std::vector<uint32_t> &end,
     const std::vector<uint32_t> &width,
     const std::vector<std::string> &chr_levels,
-    
+
     int bin_size,
     int shift_start,
     int shift_end,
     int expected_cell_count,  // If > 0, skip pre-scan (cells already discovered)
+    int signal_mode,  // 0 = tn5 (insertion), 1 = chip (coverage)
 
     std::atomic<bool> *user_interrupt
 ) {
@@ -227,10 +230,19 @@ static std::vector<uint64_t> precalculate_pseudobulk_coverage_bam_helper(
         std::move(frags), group_ids, std::make_unique<VecStringReader>(group_names)
     );
 
-    // 6. Construct tile matrix
-    std::unique_ptr<MatrixLoader<uint32_t>> tile_mat = std::make_unique<TileMatrix>(
-        std::move(frags), chr_id, start, end, width, std::make_unique<VecStringReader>(chr_levels), false
-    );
+    // 6. Construct tile matrix (TileMatrix for tn5 mode, CoverageMatrix for chip mode)
+    std::unique_ptr<MatrixLoader<uint32_t>> tile_mat;
+    if (signal_mode == 1) {
+        // ChIP mode: use CoverageMatrix for full coverage counting
+        tile_mat = std::make_unique<CoverageMatrix>(
+            std::move(frags), chr_id, start, end, width, std::make_unique<VecStringReader>(chr_levels)
+        );
+    } else {
+        // Tn5 mode: use TileMatrix for insertion counting
+        tile_mat = std::make_unique<TileMatrix>(
+            std::move(frags), chr_id, start, end, width, std::make_unique<VecStringReader>(chr_levels), false
+        );
+    }
 
     // 7. Subset to the desired columns
     tile_mat = std::make_unique<MatrixColSlice<uint32_t>>(
@@ -263,16 +275,29 @@ static std::vector<uint64_t> precalculate_pseudobulk_coverage_bam_helper(
         std::make_unique<VecStringReader>(group_names)
     );
 
-    // 10. Construct TileMatrix for writing
-    tile_mat = std::make_unique<TileMatrix>(
-        std::move(merged_frags), 
-        chr_id,
-        start,
-        end,
-        width,
-        std::make_unique<VecStringReader>(chr_levels),
-        false
-    );
+    // 10. Construct tile matrix for writing (same type as before)
+    if (signal_mode == 1) {
+        // ChIP mode: use CoverageMatrix
+        tile_mat = std::make_unique<CoverageMatrix>(
+            std::move(merged_frags),
+            chr_id,
+            start,
+            end,
+            width,
+            std::make_unique<VecStringReader>(chr_levels)
+        );
+    } else {
+        // Tn5 mode: use TileMatrix
+        tile_mat = std::make_unique<TileMatrix>(
+            std::move(merged_frags),
+            chr_id,
+            start,
+            end,
+            width,
+            std::make_unique<VecStringReader>(chr_levels),
+            false
+        );
+    }
     
     // Apply the same column slice
     tile_mat = std::make_unique<MatrixColSlice<uint32_t>>(
@@ -301,6 +326,7 @@ static std::vector<uint64_t> precalculate_pseudobulk_coverage_bam_helper(
 // This helper MUST instantiate BamFragments locally inside the thread for thread safety
 // OPTIMIZED: Accepts expected_cell_count to skip redundant pre-scan (if > 0)
 // OPTIMIZED: Reuses fragment loader to avoid double loading
+// signal_mode: 0 = tn5 (insertion counts), 1 = chip (coverage counts)
 static std::vector<uint64_t> precalculate_pseudobulk_coverage_bam_multi_helper(
     const std::vector<std::string> &bam_paths,
     const std::vector<std::string> &bam_prefixes,  // Cell prefixes for each BAM
@@ -315,11 +341,12 @@ static std::vector<uint64_t> precalculate_pseudobulk_coverage_bam_multi_helper(
     const std::vector<uint32_t> &end,
     const std::vector<uint32_t> &width,
     const std::vector<std::string> &chr_levels,
-    
+
     int bin_size,
     int shift_start,
     int shift_end,
     int expected_cell_count,  // If > 0, skip pre-scan (cells already discovered)
+    int signal_mode,  // 0 = tn5 (insertion), 1 = chip (coverage)
 
     std::atomic<bool> *user_interrupt
 ) {
@@ -376,10 +403,19 @@ static std::vector<uint64_t> precalculate_pseudobulk_coverage_bam_multi_helper(
         std::move(frags), group_ids, std::make_unique<VecStringReader>(group_names)
     );
 
-    // 7. Construct tile matrix
-    std::unique_ptr<MatrixLoader<uint32_t>> tile_mat = std::make_unique<TileMatrix>(
-        std::move(frags), chr_id, start, end, width, std::make_unique<VecStringReader>(chr_levels), false
-    );
+    // 7. Construct tile matrix (TileMatrix for tn5 mode, CoverageMatrix for chip mode)
+    std::unique_ptr<MatrixLoader<uint32_t>> tile_mat;
+    if (signal_mode == 1) {
+        // ChIP mode: use CoverageMatrix for full coverage counting
+        tile_mat = std::make_unique<CoverageMatrix>(
+            std::move(frags), chr_id, start, end, width, std::make_unique<VecStringReader>(chr_levels)
+        );
+    } else {
+        // Tn5 mode: use TileMatrix for insertion counting
+        tile_mat = std::make_unique<TileMatrix>(
+            std::move(frags), chr_id, start, end, width, std::make_unique<VecStringReader>(chr_levels), false
+        );
+    }
 
     // 8. Subset to the desired columns
     tile_mat = std::make_unique<MatrixColSlice<uint32_t>>(
@@ -425,17 +461,30 @@ static std::vector<uint64_t> precalculate_pseudobulk_coverage_bam_multi_helper(
         std::make_unique<VecStringReader>(group_names)
     );
 
-    // 11. Construct TileMatrix for writing
-    tile_mat = std::make_unique<TileMatrix>(
-        std::move(merged_frags), 
-        chr_id,
-        start,
-        end,
-        width,
-        std::make_unique<VecStringReader>(chr_levels),
-        false
-    );
-    
+    // 11. Construct tile matrix for writing (same type as before)
+    if (signal_mode == 1) {
+        // ChIP mode: use CoverageMatrix
+        tile_mat = std::make_unique<CoverageMatrix>(
+            std::move(merged_frags),
+            chr_id,
+            start,
+            end,
+            width,
+            std::make_unique<VecStringReader>(chr_levels)
+        );
+    } else {
+        // Tn5 mode: use TileMatrix
+        tile_mat = std::make_unique<TileMatrix>(
+            std::move(merged_frags),
+            chr_id,
+            start,
+            end,
+            width,
+            std::make_unique<VecStringReader>(chr_levels),
+            false
+        );
+    }
+
     // Apply the same column slice
     tile_mat = std::make_unique<MatrixColSlice<uint32_t>>(
         std::move(tile_mat), chunk_col_range.first, chunk_col_range.second
@@ -470,7 +519,8 @@ void precalculate_pseudobulk_coverage_bam(
     int shift_end,
     int bin_size,
     int threads,
-    std::optional<std::vector<std::string>> group_names
+    std::optional<std::vector<std::string>> group_names,
+    int signal_mode  // 0 = tn5 (insertion), 1 = chip (coverage)
 ) {
     // Validate inputs
     if (chr.size() != chr_len.size()) {
@@ -592,7 +642,8 @@ void precalculate_pseudobulk_coverage_bam(
                                         bin_size,
                                         shift_start,
                                         shift_end,
-                                        expected_cell_count](std::atomic<bool> *user_interrupt) {
+                                        expected_cell_count,
+                                        signal_mode](std::atomic<bool> *user_interrupt) {
         std::vector<std::future<std::vector<uint64_t>>> task_vec;
         all_group_sums.resize(chunks);
 
@@ -616,6 +667,7 @@ void precalculate_pseudobulk_coverage_bam(
                 shift_start,
                 shift_end,
                 expected_cell_count,  // Pass pre-discovered cell count
+                signal_mode,  // Pass signal mode
 
                 user_interrupt
             ));
@@ -732,7 +784,8 @@ void precalculate_pseudobulk_coverage_bam_multi(
     int shift_end,
     int bin_size,
     int threads,
-    std::optional<std::vector<std::string>> group_names
+    std::optional<std::vector<std::string>> group_names,
+    int signal_mode  // 0 = tn5 (insertion), 1 = chip (coverage)
 ) {
     // Validate inputs
     if (chr.size() != chr_len.size()) {
@@ -857,7 +910,8 @@ void precalculate_pseudobulk_coverage_bam_multi(
                                         bin_size,
                                         shift_start,
                                         shift_end,
-                                        expected_cell_count](std::atomic<bool> *user_interrupt) {
+                                        expected_cell_count,
+                                        signal_mode](std::atomic<bool> *user_interrupt) {
         std::vector<std::future<std::vector<uint64_t>>> task_vec;
         all_group_sums.resize(chunks);
 
@@ -882,6 +936,7 @@ void precalculate_pseudobulk_coverage_bam_multi(
                 shift_start,
                 shift_end,
                 expected_cell_count,  // Pass pre-discovered cell count
+                signal_mode,  // Pass signal mode
 
                 user_interrupt
             ));

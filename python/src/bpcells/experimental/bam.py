@@ -37,7 +37,8 @@ def precalculate_insertion_counts_bam(
     shift_start: int = 4,
     shift_end: int = -5,
     threads: int = 0,
-    group_names: Optional[Union[List[str], Dict[str, str]]] = None
+    group_names: Optional[Union[List[str], Dict[str, str]]] = None,
+    signal_mode: int = 0
 ) -> PrecalculatedInsertionMatrix:
     """Precalculate per-base insertion counts directly from BAM file.
 
@@ -94,6 +95,9 @@ def precalculate_insertion_counts_bam(
             Set to 0 to disable.
         threads: Number of parallel threads to use. Default is 0 (use all available CPUs).
             Each thread processes a separate chunk of the genome.
+        signal_mode: Signal extraction mode:
+            - 0 (tn5): Extract insertion sites (default, for ATAC-seq/CUT&Tag)
+            - 1 (chip): Use full fragment coverage (for ChIP-seq)
         group_names: Optional list of group names in the same order as group IDs.
             If not provided, group names are automatically derived from the BAM filename:
             - Single group: Uses filename prefix (e.g., "sample1" from "sample1.bam")
@@ -328,7 +332,7 @@ def precalculate_insertion_counts_bam(
     
     # Use context manager to ensure temp directory stays alive during C++ execution
     with tempfile.TemporaryDirectory() as tmp_dir:
-        # Try calling with group_names first (new version), fall back to old signature if needed
+        # Try calling with group_names and signal_mode first (new version), fall back to old signature if needed
         try:
             bpcells.cpp.precalculate_pseudobulk_coverage_bam(
                 bam_path,
@@ -341,23 +345,40 @@ def precalculate_insertion_counts_bam(
                 shift_end,
                 1,  # bin_size hardcoded to 1 for insertion counts
                 threads,
-                group_names_list  # Pass group names to C++ for row names
+                group_names_list,  # Pass group names to C++ for row names
+                signal_mode  # 0 = tn5 (insertion), 1 = chip (coverage)
             )
         except TypeError:
-            # Old version without group_names parameter - C++ will use numeric names
-            # Group names will still be saved in group_names.json by Python code below
-            bpcells.cpp.precalculate_pseudobulk_coverage_bam(
-                bam_path,
-                output_dir,
-                tmp_dir,
-                list(chrom_sizes.keys()),
-                list(chrom_sizes.values()),
-                cell_groups_array.tolist(),
-                shift_start,
-                shift_end,
-                1,  # bin_size hardcoded to 1 for insertion counts
-                threads
-            )
+            # Old version without signal_mode parameter - try with group_names only
+            try:
+                bpcells.cpp.precalculate_pseudobulk_coverage_bam(
+                    bam_path,
+                    output_dir,
+                    tmp_dir,
+                    list(chrom_sizes.keys()),
+                    list(chrom_sizes.values()),
+                    cell_groups_array.tolist(),
+                    shift_start,
+                    shift_end,
+                    1,  # bin_size hardcoded to 1 for insertion counts
+                    threads,
+                    group_names_list  # Pass group names to C++ for row names
+                )
+            except TypeError:
+                # Oldest version without group_names parameter - C++ will use numeric names
+                # Group names will still be saved in group_names.json by Python code below
+                bpcells.cpp.precalculate_pseudobulk_coverage_bam(
+                    bam_path,
+                    output_dir,
+                    tmp_dir,
+                    list(chrom_sizes.keys()),
+                    list(chrom_sizes.values()),
+                    cell_groups_array.tolist(),
+                    shift_start,
+                    shift_end,
+                    1,  # bin_size hardcoded to 1 for insertion counts
+                    threads
+                )
     
     # Save chrom_offsets
     chrom_offsets = dict(zip(chrom_sizes.keys(), [0] + np.cumsum(list(chrom_sizes.values()))[:-1].tolist()))
@@ -394,7 +415,8 @@ def precalculate_insertion_counts_bam_multi(
     shift_start: int = 4,
     shift_end: int = -5,
     threads: int = 0,
-    group_names: Optional[Union[List[str], Dict[str, str]]] = None
+    group_names: Optional[Union[List[str], Dict[str, str]]] = None,
+    signal_mode: int = 0
 ) -> PrecalculatedInsertionMatrix:
     """Precalculate per-base insertion counts from multiple BAM files in one call.
 
@@ -410,6 +432,9 @@ def precalculate_insertion_counts_bam_multi(
         shift_end: Basepairs to add to fragment end coordinates (default: -5)
         threads: Number of parallel threads (0 = use all available CPUs)
         group_names: Optional list of group names, one per BAM file
+        signal_mode: Signal extraction mode:
+            - 0 (tn5): Extract insertion sites (default, for ATAC-seq/CUT&Tag)
+            - 1 (chip): Use full fragment coverage (for ChIP-seq)
 
     Returns:
         PrecalculatedInsertionMatrix: A matrix object with one row per BAM file
@@ -569,21 +594,39 @@ def precalculate_insertion_counts_bam_multi(
     
     # Use context manager to ensure temp directory stays alive during C++ execution
     with tempfile.TemporaryDirectory() as tmp_dir:
-        # Call C++ multi-BAM function
-        bpcells.cpp.precalculate_pseudobulk_coverage_bam_multi(
-            bam_paths,
-            bam_prefixes,
-            output_dir,
-            tmp_dir,
-            list(chrom_sizes.keys()),
-            list(chrom_sizes.values()),
-            cell_groups_array.tolist(),
-            shift_start,
-            shift_end,
-            1,  # bin_size hardcoded to 1 for insertion counts
-            threads,
-            group_names_list  # Pass group names to C++ for row names
-        )
+        # Call C++ multi-BAM function with signal_mode, fall back to old signature if needed
+        try:
+            bpcells.cpp.precalculate_pseudobulk_coverage_bam_multi(
+                bam_paths,
+                bam_prefixes,
+                output_dir,
+                tmp_dir,
+                list(chrom_sizes.keys()),
+                list(chrom_sizes.values()),
+                cell_groups_array.tolist(),
+                shift_start,
+                shift_end,
+                1,  # bin_size hardcoded to 1 for insertion counts
+                threads,
+                group_names_list,  # Pass group names to C++ for row names
+                signal_mode  # 0 = tn5 (insertion), 1 = chip (coverage)
+            )
+        except TypeError:
+            # Old version without signal_mode - try without it
+            bpcells.cpp.precalculate_pseudobulk_coverage_bam_multi(
+                bam_paths,
+                bam_prefixes,
+                output_dir,
+                tmp_dir,
+                list(chrom_sizes.keys()),
+                list(chrom_sizes.values()),
+                cell_groups_array.tolist(),
+                shift_start,
+                shift_end,
+                1,  # bin_size hardcoded to 1 for insertion counts
+                threads,
+                group_names_list  # Pass group names to C++ for row names
+            )
     
     # Save chrom_offsets
     chrom_offsets = dict(zip(chrom_sizes.keys(), [0] + np.cumsum(list(chrom_sizes.values()))[:-1].tolist()))

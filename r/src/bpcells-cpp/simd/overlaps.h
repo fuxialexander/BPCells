@@ -59,6 +59,45 @@ uint32_t tile_overlaps(
 );
 
 /**
+ * @brief Calculate tile coverage overlaps (for ChIP-seq)
+ *
+ * Similar to tile_overlaps but counts the number of base pairs covered by each fragment
+ * within each tile, rather than just counting insertion sites.
+ *
+ * Pre-conditions:
+ *
+ * - `cell_id_out`, `tile_idx_out`, and `count_out` must have available space for at least
+ *   `max_tiles_per_fragment * n` overlaps, where max_tiles_per_fragment is the maximum
+ *   number of tiles a single fragment can span
+ * - Output arrays must not overlap in memory with any other parameters
+ *
+ * Input Data:
+ *
+ * - Fragments:`n` (cell_id, start, end) tuples passed as `cell_ids`, `starts`, `ends`.
+ *   Must be sorted by start coordinate
+ * - Tile: Given with coordinates (tile_start, tile_end), tile_width, and base output_idx
+ *
+ * Output:
+ *
+ * - For every tile overlapped by a fragment, write the cell_id, tile index, and
+ *   the count of base pairs covered in that tile
+ * - Return the total number of (cell, tile) pairs written
+ */
+uint32_t tile_overlaps_coverage(
+    const uint32_t *cell_ids,
+    const uint32_t *starts,
+    const uint32_t *ends,
+    uint32_t n,
+    const uint32_t tile_start,
+    const uint32_t tile_end,
+    const uint32_t tile_output_idx,
+    uint32_t tile_width,
+    uint32_t *cell_id_out,
+    uint32_t *tile_idx_out,
+    uint32_t *count_out
+);
+
+/**
  * @brief Calculate peak overlaps
  *
  * Pre-conditions:

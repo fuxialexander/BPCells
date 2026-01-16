@@ -152,6 +152,62 @@ uint32_t tile_overlaps_fragment(
     );
 }
 
+// Coverage mode for ChIP-seq: counts base pairs covered per tile
+// This is NOT vectorized because each fragment can span multiple tiles
+uint32_t tile_overlaps_coverage_impl(
+    const uint32_t *cell_ids,
+    const uint32_t *starts,
+    const uint32_t *ends,
+    uint32_t n,
+    const uint32_t tile_start,
+    const uint32_t tile_end,
+    const uint32_t tile_output_idx,
+    uint32_t tile_width,
+    uint32_t *HWY_RESTRICT cell_id_out,
+    uint32_t *HWY_RESTRICT tile_idx_out,
+    uint32_t *HWY_RESTRICT count_out
+) {
+    uint32_t written = 0;
+
+    for (uint32_t i = 0; i < n && starts[i] < tile_end; i++) {
+        uint32_t frag_start = starts[i];
+        uint32_t frag_end = ends[i];
+
+        // Check if fragment overlaps the tile region at all
+        if (frag_end <= tile_start || frag_start >= tile_end) {
+            continue;
+        }
+
+        // Clamp fragment to tile region bounds
+        uint32_t overlap_start = std::max(frag_start, tile_start);
+        uint32_t overlap_end = std::min(frag_end, tile_end);
+
+        // Calculate which tiles the fragment spans
+        uint32_t first_tile_idx = (overlap_start - tile_start) / tile_width;
+        uint32_t last_tile_idx = (overlap_end - 1 - tile_start) / tile_width;
+
+        // Emit coverage for each tile the fragment spans
+        for (uint32_t tile_idx = first_tile_idx; tile_idx <= last_tile_idx; tile_idx++) {
+            uint32_t this_tile_start = tile_start + tile_idx * tile_width;
+            uint32_t this_tile_end = std::min(this_tile_start + tile_width, tile_end);
+
+            // Calculate coverage within this tile
+            uint32_t cov_start = std::max(overlap_start, this_tile_start);
+            uint32_t cov_end = std::min(overlap_end, this_tile_end);
+            uint32_t coverage = cov_end - cov_start;
+
+            if (coverage > 0) {
+                cell_id_out[written] = cell_ids[i];
+                tile_idx_out[written] = tile_output_idx + tile_idx;
+                count_out[written] = coverage;
+                written++;
+            }
+        }
+    }
+
+    return written;
+}
+
 template <int MODE>
 uint32_t peak_overlaps(
     const uint32_t *cell_ids,
@@ -288,6 +344,7 @@ namespace BPCells::simd {
 
 HWY_EXPORT(tile_overlaps_insertion);
 HWY_EXPORT(tile_overlaps_fragment);
+HWY_EXPORT(tile_overlaps_coverage_impl);
 
 uint32_t tile_overlaps(
     const uint32_t *cell_ids,
@@ -331,6 +388,34 @@ uint32_t tile_overlaps(
             tile_idx_out
         );
     }
+}
+
+uint32_t tile_overlaps_coverage(
+    const uint32_t *cell_ids,
+    const uint32_t *starts,
+    const uint32_t *ends,
+    uint32_t n,
+    const uint32_t tile_start,
+    const uint32_t tile_end,
+    const uint32_t tile_output_idx,
+    uint32_t tile_width,
+    uint32_t *cell_id_out,
+    uint32_t *tile_idx_out,
+    uint32_t *count_out
+) {
+    return HWY_DYNAMIC_DISPATCH(tile_overlaps_coverage_impl)(
+        cell_ids,
+        starts,
+        ends,
+        n,
+        tile_start,
+        tile_end,
+        tile_output_idx,
+        tile_width,
+        cell_id_out,
+        tile_idx_out,
+        count_out
+    );
 }
 
 HWY_EXPORT(peak_overlaps_insertion);

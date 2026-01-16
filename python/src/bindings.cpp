@@ -52,13 +52,15 @@ PYBIND11_MODULE(cpp, m) {
                  pybind11::arg("tmp_path"), pybind11::arg("chr"), pybind11::arg("chr_len"),
                  pybind11::arg("cell_groups"), pybind11::arg("shift_start"), pybind11::arg("shift_end"),
                  pybind11::arg("bin_size"), pybind11::arg("threads"),
-                 pybind11::arg("group_names") = pybind11::none());
+                 pybind11::arg("group_names") = pybind11::none(),
+                 pybind11::arg("signal_mode") = 0);  // 0 = tn5 (insertion), 1 = chip (coverage)
            m.def("precalculate_pseudobulk_coverage_bam_multi", &BPCells::py::precalculate_pseudobulk_coverage_bam_multi,
                  pybind11::arg("bam_paths"), pybind11::arg("bam_prefixes"), pybind11::arg("output_path"),
                  pybind11::arg("tmp_path"), pybind11::arg("chr"), pybind11::arg("chr_len"),
                  pybind11::arg("cell_groups"), pybind11::arg("shift_start"), pybind11::arg("shift_end"),
                  pybind11::arg("bin_size"), pybind11::arg("threads"),
-                 pybind11::arg("group_names") = pybind11::none());
+                 pybind11::arg("group_names") = pybind11::none(),
+                 pybind11::arg("signal_mode") = 0);  // 0 = tn5 (insertion), 1 = chip (coverage)
     m.def("query_precalculated_pseudobulk_coverage", &BPCells::py::query_precalculated_pseudobulk_coverage);
         
     m.def("write_matrix_dir_from_memory", &BPCells::py::write_matrix_dir_from_memory);
