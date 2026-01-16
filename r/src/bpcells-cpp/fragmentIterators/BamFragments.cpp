@@ -277,24 +277,30 @@ bool BamFragments::load() {
             }
             
             // Extract fragment coordinates
-            // BAM is 0-based, BPCells expects 0-based half-open
-            // Start is already 0-based
-            uint32_t frag_start = b->core.pos;
-            // End is calculated from template length (isize/TLEN) for proper pairs
-            // isize is signed: positive means read1 is leftmost, negative means read2 is leftmost
-            // abs(isize) is the insert size (distance from leftmost to rightmost mapped base)
-            uint32_t frag_end;
+            // BAM is 0-based, BPCells expects 0-based half-open [start, end)
+            // TLEN (isize) is positive when READ1 is leftmost, negative when READ1 is rightmost
+            uint32_t frag_start, frag_end;
             if (b->core.tid == b->core.mtid && b->core.flag & BAM_FPROPER_PAIR && b->core.isize != 0) {
                 // Proper pair on same chromosome with valid template length
-                // Template length gives distance from leftmost to rightmost base
-                // For half-open coordinates, we want one past the rightmost base
-                frag_end = frag_start + abs(b->core.isize);
+                if (b->core.isize > 0) {
+                    // READ1 is leftmost (forward orientation)
+                    // Fragment: [pos, pos + isize)
+                    frag_start = b->core.pos;
+                    frag_end = b->core.pos + b->core.isize;
+                } else {
+                    // READ1 is rightmost (reverse orientation, negative TLEN)
+                    // Mate (READ2) is leftmost at mpos
+                    // Fragment: [mpos, read1_end) where read1_end = pos + read_length
+                    frag_start = b->core.mpos;
+                    frag_end = bam_endpos(b);  // pos + read_length (one past last base)
+                }
             } else {
-                // Fallback: use read end position (one past last base)
+                // Fallback for improper pairs or missing TLEN: use read coordinates only
+                frag_start = b->core.pos;
                 frag_end = bam_endpos(b);
             }
-            
-            // Ensure end > start
+
+            // Ensure valid fragment (end > start)
             if (frag_end <= frag_start) continue;
             
             // Check sorting (fragments should be sorted by start position)
@@ -337,16 +343,26 @@ bool BamFragments::load() {
             }
             
             // Extract fragment coordinates
-            uint32_t frag_start = b->core.pos;
-            uint32_t frag_end;
+            // BAM is 0-based, BPCells expects 0-based half-open [start, end)
+            // TLEN (isize) is positive when READ1 is leftmost, negative when READ1 is rightmost
+            uint32_t frag_start, frag_end;
             if (b->core.tid == b->core.mtid && b->core.flag & BAM_FPROPER_PAIR && b->core.isize != 0) {
                 // Proper pair on same chromosome with valid template length
-                frag_end = frag_start + abs(b->core.isize);
+                if (b->core.isize > 0) {
+                    // READ1 is leftmost (forward orientation)
+                    frag_start = b->core.pos;
+                    frag_end = b->core.pos + b->core.isize;
+                } else {
+                    // READ1 is rightmost (reverse orientation, negative TLEN)
+                    frag_start = b->core.mpos;
+                    frag_end = bam_endpos(b);
+                }
             } else {
-                // Fallback: use read end position
+                // Fallback for improper pairs or missing TLEN
+                frag_start = b->core.pos;
                 frag_end = bam_endpos(b);
             }
-            
+
             if (frag_end <= frag_start) continue;
             
             if (!first_read && frag_start < last_start) {
